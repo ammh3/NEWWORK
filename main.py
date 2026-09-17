@@ -8,10 +8,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
 
-# ========== CONFIG — IDs Apne Dal Le ==========
+# ========== CONFIG — Sab Daal Diya Hai ✅ ==========
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")   # Purana
-NEW_CHANNEL_ID  = os.getenv("NEW_CHANNEL_ID", "-100XXXXXXXXXX")  # Naya
+CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")   # Purana / Group
+NEW_CHANNEL_ID  = os.getenv("NEW_CHANNEL_ID", "-1003250473765") # Naya Channel ✅
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "8473160748"))
 PANEL_USER      = os.getenv("PANEL_USER", "5260101")
 PANEL_PASS      = os.getenv("PANEL_PASS", "Shoaibpanel@123!!!")
@@ -27,7 +27,6 @@ cookies_file = "panel_cookies.json"
 
 # ========== HIDE NUMBER ==========
 def mask_phone(phone):
-    """Number aadha dikhega, beech ke *****"""
     phone = phone.strip()
     if len(phone) <= 6:
         return phone
@@ -221,7 +220,7 @@ def extract_otp(txt):
     m = re.search(r'\b(\d{4,8})\b', txt)
     return m.group(1) if m else "N/A"
 
-# ========== SEND MESSAGE — NUMBER HIDE ==========
+# ========== SEND TO BOTH CHANNELS ✅ ==========
 async def send_channel(bot, msg):
     otp = extract_otp(msg['message'])
     masked_num = mask_phone(msg['phone'])
@@ -233,9 +232,9 @@ async def send_channel(bot, msg):
         f"🔢 Code: `{otp}`\n"
         f"📝 Message:\n`{msg['message'][:300]}`"
     )
-    await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")
-    await bot.send_message(NEW_CHANNEL_ID, text, parse_mode="Markdown")
-    print(f"✅ SENT: {masked_num} | {otp}")
+    await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")       # Purana/Group
+    await bot.send_message(NEW_CHANNEL_ID, text, parse_mode="Markdown")    # Naya Channel ✅
+    print(f"✅ SENT to both channels: {masked_num} | {otp}")
 
 # ========== POLL LOOP ==========
 async def poll_loop(bot):
@@ -267,21 +266,21 @@ async def poll_loop(bot):
         await asyncio.sleep(max(15, POLL_INTERVAL))
 
 # ========== COMMANDS ==========
-async def start(u, c):
+async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("✅ Bot Online\n/status /testfetch /relogin /clearseen")
 
-async def clearseen(u, c):
+async def clearseen(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global seen_messages
     seen_messages = set()
     await u.message.reply_text("✅ Cache cleared")
 
-async def relogin(u, c):
+async def relogin(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try: os.remove(cookies_file)
     except: pass
     ok = await do_login()
     await u.message.reply_text("✅ Done" if ok else "❌ Failed")
 
-async def status(u, c):
+async def status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msgs, _ = await get_all_messages()
     await u.message.reply_text(
         f"✅ Working\n"
@@ -289,7 +288,7 @@ async def status(u, c):
         f"Cache size: {len(seen_messages)}"
     )
 
-async def testfetch(u, c):
+async def testfetch(u: Update, c: ContextTypes.DEFAULT_TYPE):
     m = await u.message.reply_text("⏳ Fetching...")
     msgs, _ = await get_all_messages()
     if msgs:
@@ -305,9 +304,6 @@ async def testfetch(u, c):
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing")
-        return
-    if not NEW_CHANNEL_ID or NEW_CHANNEL_ID == "-100XXXXXXXXXX":
-        print("⚠️ Naya channel ID sahi nahi dala!")
         return
     await setup_browser()
     if not await is_logged_in():
