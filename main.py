@@ -156,7 +156,7 @@ async def do_login():
         return False
 
 # ============================================================
-# OTP FETCHING
+# OTP FETCHING — FIXED FOR "Select" BUTTON
 # ============================================================
 async def get_all_messages():
     all_messages = []
@@ -197,46 +197,42 @@ async def get_all_messages():
             
             print(f"   🔍 Checking number: {number} ({msg_count} messages)")
             
-            details_link = await cols[4].query_selector('a')
+            # ✅ FIXED: "Select" button dhoondho
+            select_btn = await cols[4].query_selector('button:has-text("Select")')
             
-            if details_link:
-                href = await details_link.get_attribute('href')
-                
-                if href:
-                    details_url = href if href.startswith('http') else f"https://mysmsportal.com/{href.lstrip('/')}"
+            if select_btn:
+                try:
+                    await select_btn.click()
+                    await asyncio.sleep(random.uniform(2, 3))
                     
-                    try:
-                        await page.goto(details_url, timeout=20000, wait_until='domcontentloaded')
-                        await asyncio.sleep(random.uniform(1.5, 2.5))
+                    detail_rows = await page.query_selector_all('table tr')
+                    
+                    for j in range(1, len(detail_rows)):
+                        detail_cols = await detail_rows[j].query_selector_all('td')
                         
-                        detail_rows = await page.query_selector_all('table tr')
-                        
-                        for j in range(1, len(detail_rows)):
-                            detail_cols = await detail_rows[j].query_selector_all('td')
+                        if len(detail_cols) >= 3:
+                            msg_entry = {
+                                "datetime": (await detail_cols[0].inner_text()).strip(),
+                                "phone": number,
+                                "sender": (await detail_cols[1].inner_text()).strip() if len(detail_cols) > 1 else sender,
+                                "message": (await detail_cols[-1].inner_text()).strip(),
+                            }
                             
-                            if len(detail_cols) >= 3:
-                                msg_entry = {
-                                    "datetime": (await detail_cols[0].inner_text()).strip(),
-                                    "phone": number,
-                                    "sender": (await detail_cols[1].inner_text()).strip() if len(detail_cols) > 1 else sender,
-                                    "message": (await detail_cols[-1].inner_text()).strip(),
-                                }
-                                
-                                if msg_entry["message"]:
-                                    all_messages.append(msg_entry)
-                        
-                        await page.go_back()
-                        await asyncio.sleep(random.uniform(1, 2))
-                        
-                    except Exception as e:
-                        print(f"   ⚠️ Error fetching details for {number}: {e}")
-                        try:
-                            await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
-                            await asyncio.sleep(1)
-                        except:
-                            pass
+                            if msg_entry["message"]:
+                                all_messages.append(msg_entry)
+                    
+                    await page.go_back()
+                    await asyncio.sleep(random.uniform(1.5, 2.5))
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Error fetching details for {number}: {e}")
+                    try:
+                        await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+                        await asyncio.sleep(1)
+                    except:
+                        pass
             else:
-                print(f"   ⚠️ No DETAILS link for {number}")
+                print(f"   ⚠️ No Select button for {number}")
         
         if random.random() < 0.15:
             await save_cookies()
@@ -486,8 +482,6 @@ async def relogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(cookies_file)
     except:
         pass
-    
-    await context.clear_cookies()
     
     success = await do_login()
     
