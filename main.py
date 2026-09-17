@@ -58,8 +58,7 @@ async def is_logged_in():
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=30000, wait_until='domcontentloaded')
         await asyncio.sleep(1.5)
-        content = await page.content()
-        return 'Please enter your login details' not in content
+        return 'Please enter your login details' not in await page.content()
     except: return False
 
 async def do_login():
@@ -87,7 +86,7 @@ async def do_login():
         print(f"❌ Login error: {e}")
         return False
 
-# ========== OTP FETCH — PURE LOCATOR, NO query_selector_all ==========
+# ========== OTP FETCH — EXACT FORM METHOD ==========
 async def get_all_messages():
     all_messages = []
     try:
@@ -100,65 +99,88 @@ async def get_all_messages():
             await page.goto(OTP_SUMMARY_URL, timeout=30000, wait_until='domcontentloaded')
             await asyncio.sleep(2)
 
-        rows = page.locator('table tr')
+        rows = page.locator('table tbody tr')
         n = await rows.count()
-        if n <= 1:
-            print("ℹ️ No data")
+        if n == 0:
+            print("ℹ️ No data in table")
             return [], "empty"
         
-        print(f"📊 Found {n-1} numbers")
+        print(f"📊 Found {n} numbers")
 
-        for i in range(1, n):
+        for i in range(n):
             row = rows.nth(i)
             cols = row.locator('td')
             nc = await cols.count()
-            if nc < 5: continue
+            if nc < 5:
+                continue
             
             number = (await cols.nth(0).inner_text()).strip()
+            sender = (await cols.nth(1).inner_text()).strip()
             if not number: continue
             
             print(f"   🔍 Checking: {number}")
 
-            # Button dhoondho
-            cell = cols.nth(4)
-            btn = cell.locator('button:has-text("Select")')
-            if await btn.count() == 0: btn = cell.locator('button')
-            if await btn.count() == 0: btn = cell.locator('a')
-
-            if await btn.count() > 0:
-                print(f"   ✅ Clicking...")
-                try:
-                    await btn.click()
+            # ✅ EXACT: Form ko dhoondho aur submit karo
+            form = row.locator('form')
+            if await form.count() > 0:
+                print("   ✅ Form found — submitting...")
+                await form.first.click()
+                await form.first.press('Enter')
+                await asyncio.sleep(2.5)
+                
+                # Messages padho
+                detail_rows = page.locator('table tr')
+                m_count = await detail_rows.count()
+                for j in range(1, m_count):
+                    d_cols = detail_rows.nth(j).locator('td')
+                    if await d_cols.count() >= 3:
+                        msg_text = (await d_cols.nth(-1).inner_text()).strip()
+                        if msg_text and len(msg_text) > 3:
+                            all_messages.append({
+                                "datetime": (await d_cols.nth(0).inner_text()).strip(),
+                                "phone": number,
+                                "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
+                                "message": msg_text
+                            })
+                
+                # Wapas list par
+                await page.go_back()
+                await asyncio.sleep(2)
+            else:
+                # ✅ Fallback: Select button par direct click
+                btn = row.locator('button:has-text("Select"), input[value*="Select"]')
+                if await btn.count() > 0:
+                    print("   ✅ Button found — clicking...")
+                    await btn.first.click()
                     await asyncio.sleep(2.5)
                     
-                    # Messages padho
-                    msgs = page.locator('table tr')
-                    nm = await msgs.count()
-                    for j in range(1, nm):
-                        mcol = msgs.nth(j).locator('td')
-                        if await mcol.count() >= 3:
-                            all_messages.append({
-                                "datetime": (await mcol.nth(0).inner_text()).strip(),
-                                "phone": number,
-                                "sender": (await mcol.nth(1).inner_text()).strip(),
-                                "message": (await mcol.nth(-1).inner_text()).strip()
-                            })
+                    detail_rows = page.locator('table tr')
+                    m_count = await detail_rows.count()
+                    for j in range(1, m_count):
+                        d_cols = detail_rows.nth(j).locator('td')
+                        if await d_cols.count() >= 3:
+                            msg_text = (await d_cols.nth(-1).inner_text()).strip()
+                            if msg_text and len(msg_text) > 3:
+                                all_messages.append({
+                                    "datetime": (await d_cols.nth(0).inner_text()).strip(),
+                                    "phone": number,
+                                    "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
+                                    "message": msg_text
+                                })
                     
                     await page.go_back()
                     await asyncio.sleep(2)
-                except Exception as e:
-                    print(f"   ⚠️ Click error: {e}")
-                    try: await page.goto(OTP_SUMMARY_URL, timeout=20000); await asyncio.sleep(1)
-                    except: pass
-            else:
-                print(f"   ⚠️ No button")
+                else:
+                    print("   ❌ Neither form nor button found")
 
         if random.random() < 0.2: await save_cookies()
         return all_messages, "ok"
         
     except Exception as e:
         print(f"❌ Fetch error: {e}")
-        return None, f"error"
+        import traceback
+        traceback.print_exc()
+        return None, "error"
 
 # ========== FORMAT ==========
 def extract_otp(txt):
@@ -168,10 +190,11 @@ def extract_otp(txt):
 async def send_channel(bot, msg):
     otp = extract_otp(msg['message'])
     text = (
-        f"🔐 OTP\n"
-        f"📱 {msg['phone']}\n"
+        f"🔐 OTP RECEIVED\n"
+        f"📱 Phone: `{msg['phone']}`\n"
+        f"✉️ Sender: `{msg['sender']}`\n"
         f"🔢 Code: `{otp}`\n"
-        f"📝 {msg['message'][:100]}"
+        f"📝 Message:\n`{msg['message'][:200]}`"
     )
     await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")
     print(f"✅ SENT: {msg['phone']} — {otp}")
@@ -199,7 +222,7 @@ async def poll_loop(bot):
                     await send_channel(bot, m)
                     new += 1
             if new: print(f"🔔 {new} NEW OTPs!")
-            else: print(f"ℹ️ No new")
+            else: print(f"ℹ️ No new messages")
         
         if len(seen_messages) > 3000:
             seen_messages = set(list(seen_messages)[-1500:])
@@ -220,7 +243,7 @@ async def status(u, c):
     msgs, _ = await get_all_messages()
     await u.message.reply_text(f"✅ Working\nMessages: {len(msgs) if msgs else 0}\nCache: {len(seen_messages)}")
 async def testfetch(u, c):
-    m = await u.message.reply_text("⏳...")
+    m = await u.message.reply_text("⏳ Fetching...")
     msgs, _ = await get_all_messages()
     if msgs: await m.edit_text(f"✅ {len(msgs)} found\nLatest: {msgs[-1]['phone']} — {extract_otp(msgs[-1]['message'])}")
     else: await m.edit_text("❌ Nothing found")
