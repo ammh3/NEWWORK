@@ -28,7 +28,7 @@ seen_messages = set()
 cookies_file = "panel_cookies.json"
 
 # ============================================================
-# BROWSER SETUP - STEALTH MODE
+# BROWSER SETUP
 # ============================================================
 async def setup_browser():
     global browser, context, page
@@ -156,7 +156,7 @@ async def do_login():
         return False
 
 # ============================================================
-# OTP FETCHING — FIXED FOR "Select" BUTTON
+# OTP FETCHING — MULTIPLE SELECTORS FIX
 # ============================================================
 async def get_all_messages():
     all_messages = []
@@ -197,10 +197,26 @@ async def get_all_messages():
             
             print(f"   🔍 Checking number: {number} ({msg_count} messages)")
             
-            # ✅ FIXED: "Select" button dhoondho
+            # ✅ SAB TARIKE SE BUTTON DHOONDHO
+            select_btn = None
+            
+            # Try 1: Button with text Select
             select_btn = await cols[4].query_selector('button:has-text("Select")')
             
+            # Try 2: Any button
+            if not select_btn:
+                select_btn = await cols[4].query_selector('button')
+            
+            # Try 3: Input button
+            if not select_btn:
+                select_btn = await cols[4].query_selector('input[type="button"], input[type="submit"]')
+            
+            # Try 4: Link
+            if not select_btn:
+                select_btn = await cols[4].query_selector('a')
+            
             if select_btn:
+                print(f"   ✅ Found button — clicking...")
                 try:
                     await select_btn.click()
                     await asyncio.sleep(random.uniform(2, 3))
@@ -225,14 +241,20 @@ async def get_all_messages():
                     await asyncio.sleep(random.uniform(1.5, 2.5))
                     
                 except Exception as e:
-                    print(f"   ⚠️ Error fetching details for {number}: {e}")
+                    print(f"   ⚠️ Error clicking: {e}")
                     try:
                         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
                         await asyncio.sleep(1)
                     except:
                         pass
             else:
-                print(f"   ⚠️ No Select button for {number}")
+                print(f"   ⚠️ No element found")
+                # Debug: dikhao kya hai column mein
+                try:
+                    col_content = await cols[4].inner_html()
+                    print(f"   🔍 Column content: {col_content[:300]}")
+                except:
+                    pass
         
         if random.random() < 0.15:
             await save_cookies()
@@ -253,7 +275,7 @@ async def get_all_messages():
 # ============================================================
 def extract_otp_code(message):
     patterns = [
-        r'(?:code|كود|رمز|código|код|验证码|verification|otp|pin|kode|passcode|confirmation|access|security|is your|your.*code|developer\))[\s\W:-]*(\d{3,8})',
+        r'(?:code|كود|رمز|código|код|验证码|verification|otp|pin|kode|passcode|confirmation|access|security|is your|your.*code)[\s\W:-]*(\d{3,8})',
         r'(\d{4,8})',
     ]
     
@@ -523,31 +545,28 @@ async def main():
     print("=" * 60)
     print("🤖 MySMS PORTAL OTP FORWARDER BOT")
     print("🎯 Target: mysmsportal.com")
-    print("🛡️ Mode: Playwright Stealth (Anti-Bot Detection)")
+    print("🛡️ Mode: Playwright Stealth")
     print("=" * 60)
     
     if not BOT_TOKEN:
-        print("❌ ERROR: BOT_TOKEN not set in environment variables!")
+        print("❌ ERROR: BOT_TOKEN not set!")
         return
     
-    print(f"\n📢 Telegram Channel: {CHANNEL_ID}")
-    print(f"👑 Admin Telegram ID: {ADMIN_ID}")
+    print(f"\n📢 Channel: {CHANNEL_ID}")
+    print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"🔐 Panel User: {PANEL_USER}")
-    print(f"⏱️ Poll Interval: ~{POLL_INTERVAL} seconds")
-    print()
+    print(f"⏱️ Poll: ~{POLL_INTERVAL}s\n")
     
-    print("🌐 Launching browser in stealth mode...")
+    print("🌐 Launching browser...")
     await setup_browser()
     print("✅ Browser ready!")
     
-    print("\n🔍 Checking login status...")
-    logged_in = await is_logged_in()
-    
-    if not logged_in:
-        print("⚠️ Not logged in — attempting auto-login...")
+    print("\n🔍 Checking login...")
+    if not await is_logged_in():
+        print("⚠️ Not logged in — auto-login...")
         await do_login()
     else:
-        print("✅ Already logged in! (cookies loaded)")
+        print("✅ Already logged in!")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -562,7 +581,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    print("\n✅ Telegram bot is running!")
+    print("\n✅ Bot running!")
     print("=" * 60)
     
     await poll_loop(app.bot)
@@ -571,7 +590,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
+        print("\n🛑 Stopped by user")
     except Exception as e:
         print(f"\n💥 FATAL ERROR: {e}")
         import traceback
