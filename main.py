@@ -86,7 +86,7 @@ async def do_login():
         print(f"❌ Login error: {e}")
         return False
 
-# ========== OTP FETCH — FIXED CONTEXT ISSUE ==========
+# ========== OTP FETCH — EXACT COLUMN MAPPING ==========
 async def get_all_messages():
     all_messages = []
     try:
@@ -99,7 +99,6 @@ async def get_all_messages():
             await page.goto(OTP_SUMMARY_URL, timeout=30000, wait_until='domcontentloaded')
             await asyncio.sleep(2)
 
-        # ✅ FRESH locator — har baar naya
         rows = page.locator('table tbody tr')
         n = await rows.count()
         if n == 0:
@@ -109,74 +108,84 @@ async def get_all_messages():
         print(f"📊 Found {n} numbers")
 
         for i in range(n):
-            # ✅ Har iteration mein NAYE locators — purane stale nahi honge
-            row = page.locator(f'table tbody tr:nth-child({i+1})')
+            row = rows.nth(i)
             cols = row.locator('td')
             nc = await cols.count()
             if nc < 5:
                 continue
             
             number = (await cols.nth(0).inner_text()).strip()
-            sender = (await cols.nth(1).inner_text()).strip()
+            sender = (await cols.nth(2).inner_text()).strip()
             if not number: continue
             
             print(f"   🔍 Checking: {number}")
 
-            # ✅ Form dhoondho aur click karo
-            form = row.locator('form')
+            form = row.locator('form').first
             if await form.count() > 0:
-                print("   ✅ Form found — submitting...")
+                print("   ✅ Form found — opening...")
                 try:
                     await form.click()
                     await page.wait_for_load_state('domcontentloaded', timeout=15000)
                     await asyncio.sleep(2.5)
                     
-                    # ✅ NAYA page → NAYA locator banaya
-                    detail_rows = page.locator('table tr')
+                    # ✅ DETAIL PAGE — EXACT COLUMNS
+                    detail_rows = page.locator('table tbody tr')
                     m_count = await detail_rows.count()
-                    for j in range(1, m_count):
+                    for j in range(m_count):
                         d_cols = detail_rows.nth(j).locator('td')
-                        if await d_cols.count() >= 3:
+                        col_count = await d_cols.count()
+                        if col_count >= 5:
+                            # Column 0 = DATE AND TIME
+                            dt_text = (await d_cols.nth(0).inner_text()).strip()
+                            # Column 1 = LONGCODE (phone)
+                            phone_text = (await d_cols.nth(1).inner_text()).strip()
+                            # Column 2 = SENDER
+                            sender_text = (await d_cols.nth(2).inner_text()).strip()
+                            # Column 5 or last = MESSAGE BODY
                             msg_text = (await d_cols.nth(-1).inner_text()).strip()
-                            if msg_text and len(msg_text) > 3:
+                            
+                            if msg_text and len(msg_text) > 3 and dt_text:
                                 all_messages.append({
-                                    "datetime": (await d_cols.nth(0).inner_text()).strip(),
-                                    "phone": number,
-                                    "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
+                                    "datetime": dt_text,
+                                    "phone": phone_text,
+                                    "sender": sender_text,
                                     "message": msg_text
                                 })
                     
-                    # ✅ Wapas list par — fresh page
                     await page.go_back()
                     await page.wait_for_load_state('domcontentloaded', timeout=15000)
                     await asyncio.sleep(2)
                 except Exception as e:
-                    print(f"   ⚠️ Navigate error: {e}")
+                    print(f"   ⚠️ Error: {e}")
                     try:
                         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
                         await asyncio.sleep(1.5)
                     except: pass
             else:
-                # ✅ Fallback: button click
-                btn = row.locator('button:has-text("Select"), input[value*="Select"]')
+                btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
                 if await btn.count() > 0:
-                    print("   ✅ Button found — clicking...")
+                    print("   ✅ Button found — opening...")
                     try:
-                        await btn.first.click()
+                        await btn.click()
                         await page.wait_for_load_state('domcontentloaded', timeout=15000)
                         await asyncio.sleep(2.5)
                         
-                        detail_rows = page.locator('table tr')
+                        detail_rows = page.locator('table tbody tr')
                         m_count = await detail_rows.count()
-                        for j in range(1, m_count):
+                        for j in range(m_count):
                             d_cols = detail_rows.nth(j).locator('td')
-                            if await d_cols.count() >= 3:
+                            col_count = await d_cols.count()
+                            if col_count >= 5:
+                                dt_text = (await d_cols.nth(0).inner_text()).strip()
+                                phone_text = (await d_cols.nth(1).inner_text()).strip()
+                                sender_text = (await d_cols.nth(2).inner_text()).strip()
                                 msg_text = (await d_cols.nth(-1).inner_text()).strip()
-                                if msg_text and len(msg_text) > 3:
+                                
+                                if msg_text and len(msg_text) > 3 and dt_text:
                                     all_messages.append({
-                                        "datetime": (await d_cols.nth(0).inner_text()).strip(),
-                                        "phone": number,
-                                        "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
+                                        "datetime": dt_text,
+                                        "phone": phone_text,
+                                        "sender": sender_text,
                                         "message": msg_text
                                     })
                         
@@ -190,7 +199,7 @@ async def get_all_messages():
                             await asyncio.sleep(1.5)
                         except: pass
                 else:
-                    print("   ❌ Neither form nor button found")
+                    print("   ❌ No form or button")
 
         if random.random() < 0.2: await save_cookies()
         return all_messages, "ok"
@@ -201,24 +210,25 @@ async def get_all_messages():
         traceback.print_exc()
         return None, "error"
 
-# ========== FORMAT ==========
+# ========== FORMAT OTP ==========
 def extract_otp(txt):
-    m = re.search(r'(\d{4,8})', txt)
-    return m.group(1) if m else "????"
+    m = re.search(r'\b(\d{4,8})\b', txt)
+    return m.group(1) if m else "N/A"
 
 async def send_channel(bot, msg):
     otp = extract_otp(msg['message'])
     text = (
-        f"🔐 OTP RECEIVED\n"
+        f"🔐 NEW OTP RECEIVED\n"
         f"📱 Phone: `{msg['phone']}`\n"
+        f"🕐 Time: {msg['datetime']}\n"
         f"✉️ Sender: `{msg['sender']}`\n"
         f"🔢 Code: `{otp}`\n"
-        f"📝 Message:\n`{msg['message'][:200]}`"
+        f"📝 Message:\n`{msg['message'][:300]}`"
     )
     await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")
-    print(f"✅ SENT: {msg['phone']} — {otp}")
+    print(f"✅ SENT: {msg['phone']} | {msg['datetime']}")
 
-# ========== POLL ==========
+# ========== POLL LOOP ==========
 async def poll_loop(bot):
     global seen_messages
     print("\n🔄 POLLING STARTED\n")
@@ -235,37 +245,54 @@ async def poll_loop(bot):
             err = 0
             new = 0
             for m in msgs:
-                key = f"{m['phone']}:{m['datetime']}"
-                if key not in seen_messages:
-                    seen_messages.add(key)
+                # ✅ Unique key = Time + Phone + Message → duplicate kabhi nahi
+                unique_key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
+                if unique_key not in seen_messages:
+                    seen_messages.add(unique_key)
                     await send_channel(bot, m)
                     new += 1
-            if new: print(f"🔔 {new} NEW OTPs!")
+            if new: print(f"🔔 {new} NEW messages sent!")
             else: print(f"ℹ️ No new messages")
         
-        if len(seen_messages) > 3000:
-            seen_messages = set(list(seen_messages)[-1500:])
+        # Cleanup old cache
+        if len(seen_messages) > 500:
+            seen_messages = set(list(seen_messages)[-250:])
         await asyncio.sleep(max(15, POLL_INTERVAL))
 
 # ========== COMMANDS ==========
-async def start(u, c): await u.message.reply_text("✅ Bot Online\n/status /testfetch /relogin /clearseen")
+async def start(u, c):
+    await u.message.reply_text("✅ Bot Online\n/status /testfetch /relogin /clearseen")
+
 async def clearseen(u, c):
     global seen_messages
     seen_messages = set()
-    await u.message.reply_text("✅ Cache cleared")
+    await u.message.reply_text("✅ Cache cleared — purane sab naye phir se aayenge")
+
 async def relogin(u, c):
     try: os.remove(cookies_file)
     except: pass
     ok = await do_login()
     await u.message.reply_text("✅ Done" if ok else "❌ Failed")
+
 async def status(u, c):
     msgs, _ = await get_all_messages()
-    await u.message.reply_text(f"✅ Working\nMessages: {len(msgs) if msgs else 0}\nCache: {len(seen_messages)}")
+    await u.message.reply_text(
+        f"✅ Working\n"
+        f"Messages found: {len(msgs) if msgs else 0}\n"
+        f"Cache size: {len(seen_messages)}"
+    )
+
 async def testfetch(u, c):
     m = await u.message.reply_text("⏳ Fetching...")
     msgs, _ = await get_all_messages()
-    if msgs: await m.edit_text(f"✅ {len(msgs)} found\nLatest: {msgs[-1]['phone']} — {extract_otp(msgs[-1]['message'])}")
-    else: await m.edit_text("❌ Nothing found")
+    if msgs:
+        await m.edit_text(
+            f"✅ {len(msgs)} messages found\n"
+            f"Latest: {msgs[-1]['phone']} @ {msgs[-1]['datetime']}\n"
+            f"OTP: {extract_otp(msgs[-1]['message'])}"
+        )
+    else:
+        await m.edit_text("❌ Nothing found")
 
 # ========== MAIN ==========
 async def main():
@@ -275,17 +302,21 @@ async def main():
     await setup_browser()
     if not await is_logged_in():
         await do_login()
+    
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clearseen", clearseen))
     app.add_handler(CommandHandler("relogin", relogin))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("testfetch", testfetch))
+    
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     await poll_loop(app.bot)
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("\n🛑 Stopped")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped")
