@@ -86,7 +86,7 @@ async def do_login():
         print(f"❌ Login error: {e}")
         return False
 
-# ========== OTP FETCH — EXACT FORM METHOD ==========
+# ========== OTP FETCH — FIXED CONTEXT ISSUE ==========
 async def get_all_messages():
     all_messages = []
     try:
@@ -99,6 +99,7 @@ async def get_all_messages():
             await page.goto(OTP_SUMMARY_URL, timeout=30000, wait_until='domcontentloaded')
             await asyncio.sleep(2)
 
+        # ✅ FRESH locator — har baar naya
         rows = page.locator('table tbody tr')
         n = await rows.count()
         if n == 0:
@@ -108,7 +109,8 @@ async def get_all_messages():
         print(f"📊 Found {n} numbers")
 
         for i in range(n):
-            row = rows.nth(i)
+            # ✅ Har iteration mein NAYE locators — purane stale nahi honge
+            row = page.locator(f'table tbody tr:nth-child({i+1})')
             cols = row.locator('td')
             nc = await cols.count()
             if nc < 5:
@@ -120,40 +122,16 @@ async def get_all_messages():
             
             print(f"   🔍 Checking: {number}")
 
-            # ✅ EXACT: Form ko dhoondho aur submit karo
+            # ✅ Form dhoondho aur click karo
             form = row.locator('form')
             if await form.count() > 0:
                 print("   ✅ Form found — submitting...")
-                await form.first.click()
-                await form.first.press('Enter')
-                await asyncio.sleep(2.5)
-                
-                # Messages padho
-                detail_rows = page.locator('table tr')
-                m_count = await detail_rows.count()
-                for j in range(1, m_count):
-                    d_cols = detail_rows.nth(j).locator('td')
-                    if await d_cols.count() >= 3:
-                        msg_text = (await d_cols.nth(-1).inner_text()).strip()
-                        if msg_text and len(msg_text) > 3:
-                            all_messages.append({
-                                "datetime": (await d_cols.nth(0).inner_text()).strip(),
-                                "phone": number,
-                                "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
-                                "message": msg_text
-                            })
-                
-                # Wapas list par
-                await page.go_back()
-                await asyncio.sleep(2)
-            else:
-                # ✅ Fallback: Select button par direct click
-                btn = row.locator('button:has-text("Select"), input[value*="Select"]')
-                if await btn.count() > 0:
-                    print("   ✅ Button found — clicking...")
-                    await btn.first.click()
+                try:
+                    await form.click()
+                    await page.wait_for_load_state('domcontentloaded', timeout=15000)
                     await asyncio.sleep(2.5)
                     
+                    # ✅ NAYA page → NAYA locator banaya
                     detail_rows = page.locator('table tr')
                     m_count = await detail_rows.count()
                     for j in range(1, m_count):
@@ -168,8 +146,49 @@ async def get_all_messages():
                                     "message": msg_text
                                 })
                     
+                    # ✅ Wapas list par — fresh page
                     await page.go_back()
+                    await page.wait_for_load_state('domcontentloaded', timeout=15000)
                     await asyncio.sleep(2)
+                except Exception as e:
+                    print(f"   ⚠️ Navigate error: {e}")
+                    try:
+                        await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+                        await asyncio.sleep(1.5)
+                    except: pass
+            else:
+                # ✅ Fallback: button click
+                btn = row.locator('button:has-text("Select"), input[value*="Select"]')
+                if await btn.count() > 0:
+                    print("   ✅ Button found — clicking...")
+                    try:
+                        await btn.first.click()
+                        await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                        await asyncio.sleep(2.5)
+                        
+                        detail_rows = page.locator('table tr')
+                        m_count = await detail_rows.count()
+                        for j in range(1, m_count):
+                            d_cols = detail_rows.nth(j).locator('td')
+                            if await d_cols.count() >= 3:
+                                msg_text = (await d_cols.nth(-1).inner_text()).strip()
+                                if msg_text and len(msg_text) > 3:
+                                    all_messages.append({
+                                        "datetime": (await d_cols.nth(0).inner_text()).strip(),
+                                        "phone": number,
+                                        "sender": (await d_cols.nth(1).inner_text()).strip() or sender,
+                                        "message": msg_text
+                                    })
+                        
+                        await page.go_back()
+                        await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        print(f"   ⚠️ Click error: {e}")
+                        try:
+                            await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+                            await asyncio.sleep(1.5)
+                        except: pass
                 else:
                     print("   ❌ Neither form nor button found")
 
