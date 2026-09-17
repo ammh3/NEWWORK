@@ -3,12 +3,14 @@
   "build": {
     "builder": "NIXPACKS",
     "env": {
+      "RAILPACK_PYTHON_VERSION": "3.12",
       "RAILPACK_PYTHON_PLAYWRIGHT_INSTALL": "1"
     },
     "nixpacksPlan": {
       "phases": {
         "install": {
           "cmds": [
+            "pip install --upgrade pip setuptools wheel",
             "pip install -r requirements.txt",
             "playwright install chromium",
             "playwright install-deps chromium"
