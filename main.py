@@ -8,9 +8,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
 
-# ========== CONFIG ==========
+# ========== CONFIG — IDs Apne Dal Le ==========
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")
+CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")   # Purana
+NEW_CHANNEL_ID  = os.getenv("NEW_CHANNEL_ID", "-100XXXXXXXXXX")  # Naya
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "8473160748"))
 PANEL_USER      = os.getenv("PANEL_USER", "5260101")
 PANEL_PASS      = os.getenv("PANEL_PASS", "Shoaibpanel@123!!!")
@@ -23,6 +24,16 @@ context = None
 page = None
 seen_messages = set()
 cookies_file = "panel_cookies.json"
+
+# ========== HIDE NUMBER ==========
+def mask_phone(phone):
+    """Number aadha dikhega, beech ke *****"""
+    phone = phone.strip()
+    if len(phone) <= 6:
+        return phone
+    start = phone[:4]
+    end = phone[-3:]
+    return f"{start}*****{end}"
 
 # ========== BROWSER ==========
 async def setup_browser():
@@ -86,7 +97,7 @@ async def do_login():
         print(f"❌ Login error: {e}")
         return False
 
-# ========== OTP FETCH — EXACT COLUMN MAPPING ==========
+# ========== OTP FETCH ==========
 async def get_all_messages():
     all_messages = []
     try:
@@ -128,20 +139,15 @@ async def get_all_messages():
                     await page.wait_for_load_state('domcontentloaded', timeout=15000)
                     await asyncio.sleep(2.5)
                     
-                    # ✅ DETAIL PAGE — EXACT COLUMNS
                     detail_rows = page.locator('table tbody tr')
                     m_count = await detail_rows.count()
                     for j in range(m_count):
                         d_cols = detail_rows.nth(j).locator('td')
                         col_count = await d_cols.count()
                         if col_count >= 5:
-                            # Column 0 = DATE AND TIME
                             dt_text = (await d_cols.nth(0).inner_text()).strip()
-                            # Column 1 = LONGCODE (phone)
                             phone_text = (await d_cols.nth(1).inner_text()).strip()
-                            # Column 2 = SENDER
                             sender_text = (await d_cols.nth(2).inner_text()).strip()
-                            # Column 5 or last = MESSAGE BODY
                             msg_text = (await d_cols.nth(-1).inner_text()).strip()
                             
                             if msg_text and len(msg_text) > 3 and dt_text:
@@ -210,23 +216,26 @@ async def get_all_messages():
         traceback.print_exc()
         return None, "error"
 
-# ========== FORMAT OTP ==========
+# ========== EXTRACT OTP ==========
 def extract_otp(txt):
     m = re.search(r'\b(\d{4,8})\b', txt)
     return m.group(1) if m else "N/A"
 
+# ========== SEND MESSAGE — NUMBER HIDE ==========
 async def send_channel(bot, msg):
     otp = extract_otp(msg['message'])
+    masked_num = mask_phone(msg['phone'])
     text = (
         f"🔐 NEW OTP RECEIVED\n"
-        f"📱 Phone: `{msg['phone']}`\n"
+        f"📱 Phone: `{masked_num}`\n"
         f"🕐 Time: {msg['datetime']}\n"
         f"✉️ Sender: `{msg['sender']}`\n"
         f"🔢 Code: `{otp}`\n"
         f"📝 Message:\n`{msg['message'][:300]}`"
     )
     await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")
-    print(f"✅ SENT: {msg['phone']} | {msg['datetime']}")
+    await bot.send_message(NEW_CHANNEL_ID, text, parse_mode="Markdown")
+    print(f"✅ SENT: {masked_num} | {otp}")
 
 # ========== POLL LOOP ==========
 async def poll_loop(bot):
@@ -245,7 +254,6 @@ async def poll_loop(bot):
             err = 0
             new = 0
             for m in msgs:
-                # ✅ Unique key = Time + Phone + Message → duplicate kabhi nahi
                 unique_key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
                 if unique_key not in seen_messages:
                     seen_messages.add(unique_key)
@@ -254,7 +262,6 @@ async def poll_loop(bot):
             if new: print(f"🔔 {new} NEW messages sent!")
             else: print(f"ℹ️ No new messages")
         
-        # Cleanup old cache
         if len(seen_messages) > 500:
             seen_messages = set(list(seen_messages)[-250:])
         await asyncio.sleep(max(15, POLL_INTERVAL))
@@ -266,7 +273,7 @@ async def start(u, c):
 async def clearseen(u, c):
     global seen_messages
     seen_messages = set()
-    await u.message.reply_text("✅ Cache cleared — purane sab naye phir se aayenge")
+    await u.message.reply_text("✅ Cache cleared")
 
 async def relogin(u, c):
     try: os.remove(cookies_file)
@@ -286,10 +293,10 @@ async def testfetch(u, c):
     m = await u.message.reply_text("⏳ Fetching...")
     msgs, _ = await get_all_messages()
     if msgs:
+        masked = mask_phone(msgs[-1]['phone'])
         await m.edit_text(
-            f"✅ {len(msgs)} messages found\n"
-            f"Latest: {msgs[-1]['phone']} @ {msgs[-1]['datetime']}\n"
-            f"OTP: {extract_otp(msgs[-1]['message'])}"
+            f"✅ {len(msgs)} found\n"
+            f"Latest: {masked} | OTP: {extract_otp(msgs[-1]['message'])}"
         )
     else:
         await m.edit_text("❌ Nothing found")
@@ -298,6 +305,9 @@ async def testfetch(u, c):
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing")
+        return
+    if not NEW_CHANNEL_ID or NEW_CHANNEL_ID == "-100XXXXXXXXXX":
+        print("⚠️ Naya channel ID sahi nahi dala!")
         return
     await setup_browser()
     if not await is_logged_in():
