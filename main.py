@@ -31,6 +31,20 @@ page = None
 seen_messages = set()
 cookies_file = "panel_cookies.json"
 
+# ========== SAFE SEND — WITH RETRY + ERROR HANDLING ✅ ==========
+async def safe_send(bot, chat_id, text):
+    """Send message with 3 retries — never crashes"""
+    for attempt in range(3):
+        try:
+            await bot.send_message(chat_id, text, parse_mode="Markdown", read_timeout=15, write_timeout=15)
+            return True
+        except Exception as e:
+            if attempt < 2:
+                await asyncio.sleep(2)
+            else:
+                print(f"Send failed to {chat_id}: {e}", flush=True)
+    return False
+
 # ========== DATA ==========
 def load_data():
     assignments, numbers, active_otps = {}, [], {}
@@ -151,7 +165,7 @@ async def do_login():
     except:
         return False
 
-# ========== OTP FETCH — NO EXTRA LOGS ✅ ==========
+# ========== OTP FETCH ==========
 async def get_all_messages():
     all_messages = []
     try:
@@ -223,6 +237,7 @@ def extract_otp(txt):
     m = re.search(r'\b(\d{4,8})\b', txt)
     return m.group(1) if m else "N/A"
 
+# ========== SEND OTP — SAFE VERSION ✅ ==========
 async def send_otp(bot, msg, assignments, active_otps):
     otp = extract_otp(msg['message'])
     masked = mask_phone(msg['phone'])
@@ -238,9 +253,11 @@ async def send_otp(bot, msg, assignments, active_otps):
         f"📝 Message:\n`{msg['message'][:300]}`"
     )
     
-    asyncio.create_task(bot.send_message(CHANNEL_ID, channel_text, parse_mode="Markdown"))
-    asyncio.create_task(bot.send_message(NEW_CHANNEL_ID, channel_text, parse_mode="Markdown"))
+    # ✅ Safe send — no crash, auto-retry
+    await safe_send(bot, CHANNEL_ID, channel_text)
+    await safe_send(bot, NEW_CHANNEL_ID, channel_text)
     
+    # Find user and send DM
     user_id = None
     for uid, data in assignments.items():
         if full in data["numbers"]:
@@ -256,12 +273,12 @@ async def send_otp(bot, msg, assignments, active_otps):
             f"🔢 OTP Code: `{otp}`\n\n"
             f"📝 Full Message:\n`{msg['message'][:300]}`"
         )
-        asyncio.create_task(bot.send_message(user_id, dm_text, parse_mode="Markdown"))
+        await safe_send(bot, user_id, dm_text)
     
     print(f"OTP: {masked} | {otp}", flush=True)
     return active_otps
 
-# ========== POLL LOOP — NO EXTRA LOGS ✅ ==========
+# ========== POLL LOOP ==========
 async def poll_loop(bot):
     global seen_messages
     print(f"BOT ONLINE | Poll: {POLL_INTERVAL}s | Auto-free: {EXPIRE_MINUTES}min", flush=True)
@@ -283,7 +300,7 @@ async def poll_loop(bot):
         if msgs is None:
             err += 1
             if err >= 5:
-                asyncio.create_task(bot.send_message(ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin"))
+                await safe_send(bot, ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin")
                 err = 0
         else:
             err = 0
@@ -478,7 +495,10 @@ async def main():
     await setup_browser()
     if not await is_logged_in():
         await do_login()
-    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # ✅ Bot with longer timeouts — no more TimedOut errors
+    app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).build()
+    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("mynumber", mynumber_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
@@ -491,6 +511,7 @@ async def main():
     app.add_handler(CommandHandler("relogin", relogin_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("testfetch", testfetch_cmd))
+    
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
