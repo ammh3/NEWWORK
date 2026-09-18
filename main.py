@@ -33,20 +33,12 @@ cookies_file = "panel_cookies.json"
 
 # ========== DATA ==========
 def load_data():
-    assignments = {}
-    numbers = []
-    active_otps = {}
+    assignments, numbers, active_otps = {}, [], {}
     try:
         with open(ASSIGNMENTS_FILE) as f:
             raw = json.load(f)
             for uid, data in raw.items():
-                if isinstance(data, list):
-                    assignments[uid] = {
-                        "numbers": data,
-                        "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                else:
-                    assignments[uid] = data
+                assignments[uid] = {"numbers": data, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")} if isinstance(data, list) else data
     except: pass
     try:
         with open(NUMBERS_FILE) as f: numbers = json.load(f)
@@ -57,15 +49,12 @@ def load_data():
     return assignments, numbers, active_otps
 
 def save_data(assignments, numbers, active_otps):
-    with open(ASSIGNMENTS_FILE, 'w') as f: json.dump(assignments, f, indent=2)
-    with open(NUMBERS_FILE, 'w') as f: json.dump(numbers, f, indent=2)
-    with open(ACTIVE_OTPS_FILE, 'w') as f: json.dump(active_otps, f, indent=2)
+    with open(ASSIGNMENTS_FILE, 'w') as f: json.dump(assignments, f)
+    with open(NUMBERS_FILE, 'w') as f: json.dump(numbers, f)
+    with open(ACTIVE_OTPS_FILE, 'w') as f: json.dump(active_otps, f)
 
 def get_used_numbers(assignments):
-    used = set()
-    for data in assignments.values():
-        used.update(data["numbers"])
-    return used
+    return set(n for d in assignments.values() for n in d["numbers"])
 
 def get_available_numbers(assignments, numbers):
     used = get_used_numbers(assignments)
@@ -81,31 +70,22 @@ def cleanup_expired(assignments, active_otps):
     freed_count = 0
     for uid, data in assignments.items():
         assigned_at = datetime.strptime(data["assigned_at"], "%Y-%m-%d %H:%M:%S")
-        minutes_passed = (now - assigned_at).total_seconds() / 60
-        if minutes_passed >= EXPIRE_MINUTES:
-            has_active = any(num in active_otps for num in data["numbers"])
-            if not has_active:
-                expired_users.append(uid)
-                freed_count += len(data["numbers"])
+        if (now - assigned_at).total_seconds() / 60 >= EXPIRE_MINUTES and not any(num in active_otps for num in data["numbers"]):
+            expired_users.append(uid)
+            freed_count += len(data["numbers"])
     for uid in expired_users:
         del assignments[uid]
     return freed_count, len(expired_users)
 
 def assign_numbers(user_id, assignments, numbers, active_otps, count=NUMBERS_PER_USER):
     user_id = str(user_id)
-    if user_id in assignments and len(assignments[user_id]["numbers"]) > 0:
+    if user_id in assignments and assignments[user_id]["numbers"]:
         return assignments[user_id]["numbers"], False
     available = get_available_numbers(assignments, numbers)
-    if len(available) < count:
-        if not available:
-            return None, True
-        chosen = random.sample(available, len(available))
-    else:
-        chosen = random.sample(available, count)
-    assignments[user_id] = {
-        "numbers": chosen,
-        "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+    if not available:
+        return None, True
+    chosen = random.sample(available, min(count, len(available)))
+    assignments[user_id] = {"numbers": chosen, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     save_data(assignments, numbers, active_otps)
     return chosen, True
 
@@ -120,8 +100,7 @@ def free_user_numbers(user_id, assignments, numbers, active_otps):
 
 def mask_phone(phone):
     phone = phone.strip()
-    if len(phone) <= 6: return phone
-    return f"{phone[:4]}*****{phone[-3:]}"
+    return phone if len(phone) <= 6 else f"{phone[:4]}*****{phone[-3:]}"
 
 # ========== BROWSER ==========
 async def setup_browser():
@@ -130,23 +109,17 @@ async def setup_browser():
     browser = await pw.chromium.launch(
         headless=True,
         args=['--no-sandbox','--disable-blink-features=AutomationControlled',
-              '--disable-dev-shm-usage','--disable-setuid-sandbox',
-              '--no-first-run','--no-zygote','--disable-gpu']
+              '--disable-dev-shm-usage','--disable-setuid-sandbox','--no-first-run','--no-zygote','--disable-gpu']
     )
     context = await browser.new_context(
         viewport={'width':1366,'height':768},
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        locale='en-US'
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
     )
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: ()=>undefined});
-        window.chrome={runtime:{}};
-    """)
+    await context.add_init_script("""Object.defineProperty(navigator, 'webdriver', {get: ()=>undefined});""")
     page = await context.new_page()
     try:
         with open(cookies_file) as f: await context.add_cookies(json.load(f))
-        print("🍪 Cookies loaded")
-    except: print("ℹ️ No cookies")
+    except: pass
     return page
 
 async def save_cookies():
@@ -160,7 +133,6 @@ async def is_logged_in():
     except: return False
 
 async def do_login():
-    print("🔐 Logging in...")
     try:
         await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
         await asyncio.sleep(1)
@@ -175,46 +147,55 @@ async def do_login():
         await page.locator('button, input[type="submit"]').first.click()
         await asyncio.sleep(1.5)
         await save_cookies()
-        ok = await is_logged_in()
-        print("✅ LOGIN OK" if ok else "❌ Login failed")
-        return ok
-    except Exception as e:
-        print(f"❌ Login error: {e}")
+        return await is_logged_in()
+    except:
         return False
 
-# ========== OTP FETCH ==========
+# ========== OTP FETCH — NO EXTRA LOGS ✅ ==========
 async def get_all_messages():
     all_messages = []
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
         await asyncio.sleep(0.8)
         if 'Please enter your login details' in await page.content():
-            print("⚠️ Re-login...")
-            if not await do_login(): return None, "login_fail"
+            if not await do_login():
+                return None, "login_fail"
             await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
             await asyncio.sleep(0.8)
         rows = page.locator('table tbody tr')
         n = await rows.count()
-        if n == 0: return [], "empty"
-        print(f"📊 Found {n} numbers")
+        if n == 0:
+            return [], "empty"
         for i in range(n):
             row = rows.nth(i)
             cols = row.locator('td')
-            nc = await cols.count()
-            if nc < 5: continue
+            if await cols.count() < 5:
+                continue
             number = (await cols.nth(0).inner_text()).strip()
-            if not number: continue
-            print(f"   🔍 Checking: {number}")
+            if not number:
+                continue
             form = row.locator('form').first
+            clicked = False
             if await form.count() > 0:
-                print("   ✅ Form found — opening...")
                 try:
                     await form.click()
+                    clicked = True
+                except:
+                    pass
+            if not clicked:
+                btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
+                if await btn.count() > 0:
+                    try:
+                        await btn.click()
+                        clicked = True
+                    except:
+                        pass
+            if clicked:
+                try:
                     await page.wait_for_load_state('domcontentloaded', timeout=8000)
                     await asyncio.sleep(1)
                     detail_rows = page.locator('table tbody tr')
-                    m_count = await detail_rows.count()
-                    for j in range(m_count):
+                    for j in range(await detail_rows.count()):
                         d_cols = detail_rows.nth(j).locator('td')
                         if await d_cols.count() >= 5:
                             dt = (await d_cols.nth(0).inner_text()).strip()
@@ -226,44 +207,16 @@ async def get_all_messages():
                     await page.go_back()
                     await page.wait_for_load_state('domcontentloaded', timeout=8000)
                     await asyncio.sleep(0.5)
-                except Exception as e:
-                    print(f"   ⚠️ Error: {e}")
+                except:
                     try:
                         await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
                         await asyncio.sleep(0.5)
-                    except: pass
-            else:
-                btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
-                if await btn.count() > 0:
-                    print("   ✅ Button found — opening...")
-                    try:
-                        await btn.click()
-                        await page.wait_for_load_state('domcontentloaded', timeout=8000)
-                        await asyncio.sleep(1)
-                        detail_rows = page.locator('table tbody tr')
-                        m_count = await detail_rows.count()
-                        for j in range(m_count):
-                            d_cols = detail_rows.nth(j).locator('td')
-                            if await d_cols.count() >= 5:
-                                dt = (await d_cols.nth(0).inner_text()).strip()
-                                ph = (await d_cols.nth(1).inner_text()).strip()
-                                se = (await d_cols.nth(2).inner_text()).strip()
-                                ms = (await d_cols.nth(-1).inner_text()).strip()
-                                if ms and len(ms) > 3 and dt:
-                                    all_messages.append({"datetime":dt,"phone":ph,"sender":se,"message":ms})
-                        await page.go_back()
-                        await page.wait_for_load_state('domcontentloaded', timeout=8000)
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        print(f"   ⚠️ Click error: {e}")
-                        try:
-                            await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
-                            await asyncio.sleep(0.5)
-                        except: pass
-        if random.random() < 0.2: await save_cookies()
+                    except:
+                        pass
+        if random.random() < 0.2:
+            await save_cookies()
         return all_messages, "ok"
     except Exception as e:
-        print(f"❌ Fetch error: {e}")
         return None, "error"
 
 def extract_otp(txt):
@@ -275,6 +228,7 @@ async def send_otp(bot, msg, assignments, active_otps):
     masked = mask_phone(msg['phone'])
     full = msg['phone']
     active_otps = mark_number_active(full, active_otps)
+    
     channel_text = (
         f"🔐 NEW OTP RECEIVED\n"
         f"📱 Phone: `{masked}`\n"
@@ -283,13 +237,16 @@ async def send_otp(bot, msg, assignments, active_otps):
         f"🔢 Code: `{otp}`\n"
         f"📝 Message:\n`{msg['message'][:300]}`"
     )
+    
     asyncio.create_task(bot.send_message(CHANNEL_ID, channel_text, parse_mode="Markdown"))
     asyncio.create_task(bot.send_message(NEW_CHANNEL_ID, channel_text, parse_mode="Markdown"))
+    
     user_id = None
     for uid, data in assignments.items():
         if full in data["numbers"]:
             user_id = int(uid)
             break
+    
     if user_id:
         dm_text = (
             f"🔐 YOUR OTP ARRIVED ✅\n\n"
@@ -297,52 +254,49 @@ async def send_otp(bot, msg, assignments, active_otps):
             f"🕐 Time: {msg['datetime']}\n"
             f"✉️ Sender: `{msg['sender']}`\n"
             f"🔢 OTP Code: `{otp}`\n\n"
-            f"📝 Full Message:\n`{msg['message'][:300]}`\n\n"
-            f"⚡ Fast Delivery | 🤖 Auto Bot"
+            f"📝 Full Message:\n`{msg['message'][:300]}`"
         )
         asyncio.create_task(bot.send_message(user_id, dm_text, parse_mode="Markdown"))
-        print(f"✅ DM to {user_id}: {full} | {otp}")
-    print(f"✅ Channels: {masked} | {otp}")
+    
+    print(f"OTP: {masked} | {otp}", flush=True)
     return active_otps
 
-# ========== POLL LOOP ==========
+# ========== POLL LOOP — NO EXTRA LOGS ✅ ==========
 async def poll_loop(bot):
     global seen_messages
-    print(f"\n🔄 POLLING STARTED — EVERY {POLL_INTERVAL} SEC ⚡\n")
-    print(f"👤 Numbers per user: {NUMBERS_PER_USER}")
-    print(f"⏰ Auto-free: {EXPIRE_MINUTES} MINUTES\n")
+    print(f"BOT ONLINE | Poll: {POLL_INTERVAL}s | Auto-free: {EXPIRE_MINUTES}min", flush=True)
     err = 0
     cleanup_counter = 0
+    
     while True:
-        msgs, st = await get_all_messages()
+        msgs, _ = await get_all_messages()
         assignments, numbers, active_otps = load_data()
+        
         cleanup_counter += 1
         if cleanup_counter >= 5:
             cleanup_counter = 0
             freed, users = cleanup_expired(assignments, active_otps)
             if freed > 0:
-                print(f"🧹 AUTO-CLEANUP: {freed} numbers freed from {users} users\n")
+                print(f"FREED: {freed} numbers ({users} users)", flush=True)
                 save_data(assignments, numbers, active_otps)
+        
         if msgs is None:
             err += 1
-            print(f"⚠️ Error {err}/5")
             if err >= 5:
                 asyncio.create_task(bot.send_message(ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin"))
                 err = 0
         else:
             err = 0
-            new = 0
             for m in msgs:
                 key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
                 if key not in seen_messages:
                     seen_messages.add(key)
                     active_otps = await send_otp(bot, m, assignments, active_otps)
-                    new += 1
             save_data(assignments, numbers, active_otps)
-            if new: print(f"🔔 {new} NEW sent!\n")
-            else: print(f"ℹ️ No new\n")
+        
         if len(seen_messages) > 500:
             seen_messages = set(list(seen_messages)[-250:])
+        
         await asyncio.sleep(max(5, POLL_INTERVAL))
 
 # ========== USER COMMANDS ==========
@@ -351,35 +305,23 @@ async def start_cmd(u: Update, c: ContextTypes):
     name = u.effective_user.first_name
     assignments, numbers, active_otps = load_data()
     if not numbers:
-        await u.message.reply_text(
-            "⚠️ *Numbers abhi upload nahi hue!*\nAdmin jald hi upload karega 🙏",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text("⚠️ Numbers abhi upload nahi hue! Admin jald karega 🙏", parse_mode="Markdown")
         return
     user_nums, is_new = assign_numbers(user_id, assignments, numbers, active_otps)
     if user_nums is None:
-        await u.message.reply_text(
-            "😔 *Saare numbers use ho chuke!*\nJaldi hi expire honge — try again 🙏",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text("😔 Saare numbers use ho chuke! Jaldi expire honge — try again 🙏", parse_mode="Markdown")
         return
     nums_text = "\n".join([f"  {i+1}. `{num}`" for i, num in enumerate(user_nums)])
     if is_new:
         await u.message.reply_text(
-            f"🎉 *Welcome {name}!*\n\n"
-            f"✅ Tere {len(user_nums)} numbers assign ho gaye:\n{nums_text}\n\n"
-            f"⏰ *Rules:*\n"
-            f"   ✅ 10 minute mein OTP aaya → permanent tera!\n"
-            f"   ❌ Nahi aaya → auto-free, naye le lena /refresh se\n\n"
-            f"🔄 Naye chahiye? /refresh\n"
-            f"📱 Dekhne ke liye: /mynumber",
+            f"🎉 Welcome {name}!\n\n✅ Tere {len(user_nums)} numbers:\n{nums_text}\n\n"
+            f"⏰ 10min mein OTP aaya → permanent tera!\n"
+            f"❌ Nahi aaya → /refresh se naye le\n\n🔄 Naye chahiye? /refresh",
             parse_mode="Markdown"
         )
     else:
         await u.message.reply_text(
-            f"👋 *Welcome back {name}!*\n\n"
-            f"📱 Tere numbers:\n{nums_text}\n\n"
-            f"⏰ 10 min mein OTP nahi aaya toh naye le /refresh se ✅",
+            f"👋 Welcome back {name}!\n\n📱 Tere numbers:\n{nums_text}\n\n🔄 Naye chahiye? /refresh",
             parse_mode="Markdown"
         )
 
@@ -388,23 +330,13 @@ async def mynumber_cmd(u: Update, c: ContextTypes):
     assignments, _, active_otps = load_data()
     if str(user_id) in assignments:
         data = assignments[str(user_id)]
-        user_nums = data["numbers"]
-        assigned_at = data["assigned_at"]
         nums_text = ""
-        for i, num in enumerate(user_nums):
-            status = "✅ LOCKED (OTP aaya)" if num in active_otps else "⏳ Waiting (10min timer)"
+        for i, num in enumerate(data["numbers"]):
+            status = "✅ LOCKED" if num in active_otps else "⏳ Waiting"
             nums_text += f"  {i+1}. `{num}` — {status}\n"
-        await u.message.reply_text(
-            f"📱 *Tere Numbers:*\n{nums_text}"
-            f"📅 Assigned: {assigned_at}\n\n"
-            f"🔄 Naye chahiye? /refresh",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text(f"📱 Tere Numbers:\n{nums_text}\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
     else:
-        await u.message.reply_text(
-            "❌ Abhi koi number nahi!\nPane ke liye /start karein",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text("❌ Pehle /start karein", parse_mode="Markdown")
 
 async def refresh_cmd(u: Update, c: ContextTypes):
     user_id = u.effective_user.id
@@ -414,30 +346,18 @@ async def refresh_cmd(u: Update, c: ContextTypes):
         return
     old_data = assignments[str(user_id)]
     old_nums = old_data["numbers"]
-    has_any_otp = any(num in active_otps for num in old_nums)
-    if has_any_otp:
-        await u.message.reply_text(
-            "✅ *Tere number par OTP aaya hai!*\nIsliye refresh nahi kar sakte — yeh permanent tera hai ✅",
-            parse_mode="Markdown"
-        )
+    if any(num in active_otps for num in old_nums):
+        await u.message.reply_text("✅ Tere number par OTP aaya hai — permanent tera hai ✅", parse_mode="Markdown")
         return
     del assignments[str(user_id)]
-    new_nums, is_new = assign_numbers(user_id, assignments, numbers, active_otps)
+    new_nums, _ = assign_numbers(user_id, assignments, numbers, active_otps)
     if new_nums is None:
-        assignments[str(user_id)] = {
-            "numbers": old_nums,
-            "assigned_at": old_data["assigned_at"]
-        }
+        assignments[str(user_id)] = {"numbers": old_nums, "assigned_at": old_data["assigned_at"]}
         save_data(assignments, numbers, active_otps)
-        await u.message.reply_text("😔 Abhi naye numbers nahi available!")
+        await u.message.reply_text("😔 Naye numbers nahi available!")
         return
     nums_text = "\n".join([f"  {i+1}. `{num}`" for i, num in enumerate(new_nums)])
-    await u.message.reply_text(
-        f"🔄 *Refreshed! Naye numbers mil gaye ✅*\n\n{nums_text}\n\n"
-        f"⏰ Ab 10 minute wait karein\n"
-        f"❌ Fir bhi nahi aaya? Dobara /refresh",
-        parse_mode="Markdown"
-    )
+    await u.message.reply_text(f"🔄 Refreshed!\n✅ Naye numbers:\n{nums_text}", parse_mode="Markdown")
 
 # ========== ADMIN COMMANDS ==========
 async def upload_numbers_cmd(u: Update, c: ContextTypes):
@@ -445,38 +365,19 @@ async def upload_numbers_cmd(u: Update, c: ContextTypes):
         await u.message.reply_text("❌ Admin only!")
         return
     if not u.message.text or len(u.message.text.split()) < 2:
-        await u.message.reply_text(
-            "📝 *Use:*\n`/uploadnumbers +591xxx, +591yyy, ...`\n\nYa har line mein ek number",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text("📝 Use: `/uploadnumbers +591xxx, +591yyy...`", parse_mode="Markdown")
         return
     text = u.message.text.replace('/uploadnumbers', '').strip()
-    raw = re.split(r'[,\n]+', text)
-    new_nums = []
-    for num in raw:
-        num = num.strip()
-        if num and num.startswith('+'):
-            new_nums.append(num)
+    new_nums = [n.strip() for n in re.split(r'[,\n]+', text) if n.strip().startswith('+')]
     if not new_nums:
         await u.message.reply_text("❌ Koi valid number nahi mila!")
         return
     assignments, existing, active_otps = load_data()
-    added = 0
-    for num in new_nums:
-        if num not in existing:
-            existing.append(num)
-            added += 1
+    added = sum(1 for n in new_nums if n not in existing)
+    existing.extend(n for n in new_nums if n not in existing)
     save_data(assignments, existing, active_otps)
-    available = get_available_numbers(assignments, existing)
-    await u.message.reply_text(
-        f"✅ *Uploaded!*\n"
-        f"📥 Naye: `{added}`\n"
-        f"📊 Total: `{len(existing)}`\n"
-        f"🆓 Available: `{len(available)}`\n"
-        f"👤 Users: `{len(assignments)}`\n"
-        f"✅ Locked: `{len(active_otps)}`",
-        parse_mode="Markdown"
-    )
+    avail = len(get_available_numbers(assignments, existing))
+    await u.message.reply_text(f"✅ Uploaded!\nNaye: {added} | Total: {len(existing)} | Available: {avail} | Locked: {len(active_otps)}", parse_mode="Markdown")
 
 async def freeuser_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
@@ -489,10 +390,7 @@ async def freeuser_cmd(u: Update, c: ContextTypes):
     target = parts[1].strip()
     assignments, numbers, active_otps = load_data()
     freed = free_user_numbers(target, assignments, numbers, active_otps)
-    if freed > 0:
-        await u.message.reply_text(f"✅ User {target} ke {freed} numbers free!")
-    else:
-        await u.message.reply_text("❌ Nahi mila!")
+    await u.message.reply_text(f"✅ Freed: {freed}" if freed else "❌ Nahi mila!")
 
 async def freenumber_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
@@ -514,63 +412,35 @@ async def freenumber_cmd(u: Update, c: ContextTypes):
             break
     if found:
         save_data(assignments, numbers, active_otps)
-        await u.message.reply_text(f"✅ {target} free ho gaya!")
+        await u.message.reply_text("✅ Freed!")
     else:
-        await u.message.reply_text("❌ Number assigned nahi hai!")
+        await u.message.reply_text("❌ Nahi mila!")
 
 async def cleanunused_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
-    m = await u.message.reply_text("🧹 Cleaning...")
     assignments, numbers, active_otps = load_data()
     freed, users = cleanup_expired(assignments, active_otps)
     save_data(assignments, numbers, active_otps)
-    await m.edit_text(
-        f"🧹 *Cleanup Done!*\n\n"
-        f"📱 Freed: `{freed}` numbers\n"
-        f"👤 Users removed: `{users}`\n"
-        f"🆓 Available: `{len(get_available_numbers(assignments, numbers))}`",
-        parse_mode="Markdown"
-    )
+    await u.message.reply_text(f"✅ Cleaned!\nFreed: {freed} | Users: {users}", parse_mode="Markdown")
 
 async def stats_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
     assignments, numbers, active_otps = load_data()
-    available = get_available_numbers(assignments, numbers)
+    avail = len(get_available_numbers(assignments, numbers))
     await u.message.reply_text(
-        f"📊 *System Stats*\n\n"
-        f"📱 Total: `{len(numbers)}`\n"
-        f"🆓 Available: `{len(available)}`\n"
-        f"👤 Users: `{len(assignments)}`\n"
-        f"✅ Locked: `{len(active_otps)}`\n"
-        f"🔢 Per user: `{NUMBERS_PER_USER}`\n"
-        f"⏰ Auto-free: `{EXPIRE_MINUTES} min`",
+        f"📊 Stats:\nTotal: {len(numbers)} | Available: {avail}\nUsers: {len(assignments)} | Locked: {len(active_otps)}",
         parse_mode="Markdown"
     )
 
-async def assignments_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    assignments, _ = load_data()
-    if not assignments:
-        await u.message.reply_text("ℹ️ Koi nahi hai")
-        return
-    text = "📋 *Assignments:*\n\n"
-    for uid, data in list(assignments.items())[:20]:
-        status = "🔒" if any(n in active_otps for n in data["numbers"]) else "⏳"
-        nums_short = ", ".join([mask_phone(n) for n in data["numbers"]])
-        text += f"{status} `{uid}` → {nums_short}\n"
-    await u.message.reply_text(text, parse_mode="Markdown")
-
 async def clearseen_cmd(u: Update, c: ContextTypes):
-    global seen_messages
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
+    global seen_messages
     seen_messages = set()
     await u.message.reply_text("✅ Cleared!")
 
@@ -594,22 +464,17 @@ async def testfetch_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
-    m = await u.message.reply_text("⏳ Fetching...")
     msgs, _ = await get_all_messages()
-    if msgs:
-        await m.edit_text(f"✅ {len(msgs)} found\nLatest: {mask_phone(msgs[-1]['phone'])} | {extract_otp(msgs[-1]['message'])}")
-    else:
-        await m.edit_text("❌ Nothing found")
+    await u.message.reply_text(f"✅ {len(msgs)} found" if msgs else "❌ Nothing")
 
 # ========== MAIN ==========
 async def main():
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN missing")
+        print("❌ BOT_TOKEN missing!", flush=True)
         return
     assignments, numbers, active_otps = load_data()
     save_data(assignments, numbers, active_otps)
-    print(f"📊 Loaded: {len(numbers)} numbers, {len(assignments)} users")
-    print(f"✅ Locked: {len(active_otps)} | ⏰ Auto-free: {EXPIRE_MINUTES}min")
+    print(f"LOADED: {len(numbers)} numbers | {len(assignments)} users", flush=True)
     await setup_browser()
     if not await is_logged_in():
         await do_login()
@@ -622,7 +487,6 @@ async def main():
     app.add_handler(CommandHandler("freenumber", freenumber_cmd))
     app.add_handler(CommandHandler("cleanunused", cleanunused_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("assignments", assignments_cmd))
     app.add_handler(CommandHandler("clearseen", clearseen_cmd))
     app.add_handler(CommandHandler("relogin", relogin_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -630,11 +494,10 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    print(f"\n✅ BOT ONLINE — 10MIN AUTO-FREE ACTIVE ⚡\n")
     await poll_loop(app.bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Stopped")
+        print("STOPPED", flush=True)
