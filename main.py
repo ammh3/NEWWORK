@@ -3,13 +3,11 @@ import json
 import os
 import random
 import re
-import threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
 
-# ========== CONFIG ==========
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")
 NEW_CHANNEL_ID  = os.getenv("NEW_CHANNEL_ID", "-1003250473765")
@@ -18,217 +16,194 @@ PANEL_USER      = os.getenv("PANEL_USER", "5260101")
 PANEL_PASS      = os.getenv("PANEL_PASS", "Shoaibpanel@123!!!")
 LOGIN_URL       = "https://mysmsportal.com/index.php"
 OTP_SUMMARY_URL = "https://mysmsportal.com/index.php?opt=shw_sts_today"
-POLL_INTERVAL   = int(os.getenv("POLL_INTERVAL", "10"))
+POLL_INTERVAL   = int(os.getenv("POLL_INTERVAL", "15"))
 NUMBERS_PER_USER = 4
 EXPIRE_MINUTES   = 10
 
 ASSIGNMENTS_FILE = "user_assignments.json"
 NUMBERS_FILE     = "panel_numbers.json"
 ACTIVE_OTPS_FILE = "active_otp_numbers.json"
-
-seen_messages = set()
 cookies_file = "panel_cookies.json"
+seen_messages = set()
 
-# Shared bot reference (set after app starts)
-bot_instance = None
+# Playwright state — ready hone tak None rahega
+pw_ready = False
+page = None
+context = None
+browser = None
 
-# ========== SAFE SEND ==========
 async def safe_send(bot, chat_id, text):
-    for attempt in range(3):
+    for _ in range(3):
         try:
             await bot.send_message(chat_id, text, parse_mode="Markdown", read_timeout=15, write_timeout=15)
             return True
         except Exception:
-            if attempt < 2:
-                await asyncio.sleep(2)
+            await asyncio.sleep(2)
     return False
 
-# ========== DATA ==========
 def load_data():
-    assignments, numbers, active_otps = {}, [], {}
+    a, n, o = {}, [], {}
     try:
         with open(ASSIGNMENTS_FILE) as f:
             raw = json.load(f)
-            for uid, data in raw.items():
-                assignments[uid] = {"numbers": data, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")} if isinstance(data, list) else data
+            for uid, d in raw.items():
+                a[uid] = {"numbers": d, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")} if isinstance(d, list) else d
     except: pass
     try:
-        with open(NUMBERS_FILE) as f: numbers = json.load(f)
+        with open(NUMBERS_FILE) as f: n = json.load(f)
     except: pass
     try:
-        with open(ACTIVE_OTPS_FILE) as f: active_otps = json.load(f)
+        with open(ACTIVE_OTPS_FILE) as f: o = json.load(f)
     except: pass
-    return assignments, numbers, active_otps
+    return a, n, o
 
-def save_data(assignments, numbers, active_otps):
-    with open(ASSIGNMENTS_FILE, 'w') as f: json.dump(assignments, f)
-    with open(NUMBERS_FILE, 'w') as f: json.dump(numbers, f)
-    with open(ACTIVE_OTPS_FILE, 'w') as f: json.dump(active_otps, f)
+def save_data(a, n, o):
+    with open(ASSIGNMENTS_FILE, 'w') as f: json.dump(a, f)
+    with open(NUMBERS_FILE, 'w') as f: json.dump(n, f)
+    with open(ACTIVE_OTPS_FILE, 'w') as f: json.dump(o, f)
 
-def get_used_numbers(assignments):
-    return set(n for d in assignments.values() for n in d["numbers"])
+def get_assigned(a):
+    return set(num for d in a.values() for num in d["numbers"])
 
-def get_available_numbers(assignments, numbers):
-    used = get_used_numbers(assignments)
-    return [n for n in numbers if n not in used]
+def get_available(a, n):
+    used = get_assigned(a)
+    return [x for x in n if x not in used]
 
-def mark_number_active(number, active_otps):
-    active_otps[number] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return active_otps
-
-def cleanup_expired(assignments, active_otps):
+def cleanup_expired(a, o):
     now = datetime.now()
-    expired_users = []
-    freed_count = 0
-    for uid, data in assignments.items():
-        assigned_at = datetime.strptime(data["assigned_at"], "%Y-%m-%d %H:%M:%S")
-        if (now - assigned_at).total_seconds() / 60 >= EXPIRE_MINUTES and not any(num in active_otps for num in data["numbers"]):
-            expired_users.append(uid)
-            freed_count += len(data["numbers"])
-    for uid in expired_users:
-        del assignments[uid]
-    return freed_count, len(expired_users)
+    exp, freed = [], 0
+    for uid, d in a.items():
+        at = datetime.strptime(d["assigned_at"], "%Y-%m-%d %H:%M:%S")
+        if (now - at).total_seconds()/60 >= EXPIRE_MINUTES and not any(x in o for x in d["numbers"]):
+            exp.append(uid); freed += len(d["numbers"])
+    for uid in exp: del a[uid]
+    return freed, len(exp)
 
-def assign_numbers(user_id, assignments, numbers, active_otps, count=NUMBERS_PER_USER):
-    user_id = str(user_id)
-    if user_id in assignments and assignments[user_id]["numbers"]:
-        return assignments[user_id]["numbers"], False
-    available = get_available_numbers(assignments, numbers)
-    if not available:
-        return None, True
-    chosen = random.sample(available, min(count, len(available)))
-    assignments[user_id] = {"numbers": chosen, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    save_data(assignments, numbers, active_otps)
+def assign_nums(uid, a, n, o, cnt=NUMBERS_PER_USER):
+    uid = str(uid)
+    if uid in a and a[uid]["numbers"]: return a[uid]["numbers"], False
+    avail = get_available(a, n)
+    if not avail: return None, True
+    chosen = random.sample(avail, min(cnt, len(avail)))
+    a[uid] = {"numbers": chosen, "assigned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    save_data(a, n, o)
     return chosen, True
 
-def free_user_numbers(user_id, assignments, numbers, active_otps):
-    user_id = str(user_id)
-    if user_id in assignments:
-        freed = len(assignments[user_id]["numbers"])
-        del assignments[user_id]
-        save_data(assignments, numbers, active_otps)
-        return freed
-    return 0
+def mask(p):
+    p = p.strip()
+    return p if len(p) <= 6 else f"{p[:4]}*****{p[-3:]}"
 
-def mask_phone(phone):
-    phone = phone.strip()
-    return phone if len(phone) <= 6 else f"{phone[:4]}*****{phone[-3:]}"
-
-def extract_otp(txt):
-    m = re.search(r'\b(\d{4,8})\b', txt)
+def extract_otp(t):
+    m = re.search(r'\b(\d{4,8})\b', t)
     return m.group(1) if m else "N/A"
 
-# ========== PLAYWRIGHT IN SEPARATE THREAD ✅ ==========
-# Yeh poora Playwright kaam alag thread mein chalega
-# Telegram bot ka event loop bilkul free rahega → INSTANT commands
-
-browser_state = {"page": None, "context": None, "browser": None}
-
-async def playwright_setup():
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=['--no-sandbox','--disable-blink-features=AutomationControlled',
-              '--disable-dev-shm-usage','--disable-setuid-sandbox','--no-first-run','--no-zygote','--disable-gpu']
-    )
-    context = await browser.new_context(
-        viewport={'width':1366,'height':768},
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-    )
-    await context.add_init_script("""Object.defineProperty(navigator, 'webdriver', {get: ()=>undefined});""")
-    page = await context.new_page()
+# ========== PLAYWRIGHT — BACKGROUND MEIN SETUP HOGA ==========
+async def pw_setup_and_login():
+    global pw_ready, page, context, browser
     try:
-        with open(cookies_file) as f: await context.add_cookies(json.load(f))
-    except: pass
-    browser_state["page"] = page
-    browser_state["context"] = context
-    browser_state["browser"] = browser
-    return page
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
+        context = await browser.new_context(viewport={'width':1366,'height':768}, user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36')
+        page = await context.new_page()
+        try:
+            with open(cookies_file) as f: await context.add_cookies(json.load(f))
+        except: pass
+        
+        # Login
+        try:
+            await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+            await asyncio.sleep(0.5)
+            if 'Please enter your login details' in await page.content():
+                await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
+                await asyncio.sleep(1)
+                u = page.locator('input[type="text"]').first
+                await u.click()
+                for c in PANEL_USER: await u.type(c, delay=30)
+                await asyncio.sleep(0.3)
+                p = page.locator('input[type="password"]').first
+                await p.click()
+                for c in PANEL_PASS: await p.type(c, delay=30)
+                await asyncio.sleep(0.3)
+                await page.locator('button, input[type="submit"]').first.click()
+                await asyncio.sleep(1.5)
+                with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+        except: pass
+        
+        pw_ready = True
+        print("✅ Playwright ready — OTP polling shuru", flush=True)
+    except Exception as e:
+        print(f"Playwright setup error: {e}", flush=True)
+        # Retry after 10 sec
+        await asyncio.sleep(10)
+        asyncio.create_task(pw_setup_and_login())
 
 async def save_cookies():
-    with open(cookies_file,'w') as f: json.dump(await browser_state["context"].cookies(), f)
-
-async def is_logged_in():
-    page = browser_state["page"]
     try:
-        await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
-        await asyncio.sleep(0.5)
-        return 'Please enter your login details' not in await page.content()
-    except: return False
+        with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+    except: pass
 
-async def do_login():
-    page = browser_state["page"]
-    try:
-        await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
-        await asyncio.sleep(1)
-        user = page.locator('input[type="text"]').first
-        await user.click()
-        for c in PANEL_USER: await user.type(c, delay=random.randint(20,50))
-        await asyncio.sleep(0.3)
-        pwd = page.locator('input[type="password"]').first
-        await pwd.click()
-        for c in PANEL_PASS: await pwd.type(c, delay=random.randint(20,50))
-        await asyncio.sleep(0.3)
-        await page.locator('button, input[type="submit"]').first.click()
-        await asyncio.sleep(1.5)
-        await save_cookies()
-        return await is_logged_in()
-    except:
-        return False
-
-async def get_all_messages():
-    page = browser_state["page"]
-    all_messages = []
+async def fetch_otps():
+    if not pw_ready or page is None:
+        return []
+    a, n, o = load_data()
+    assigned = get_assigned(a)
+    if not assigned:
+        return []
+    all_msgs = []
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
         await asyncio.sleep(0.8)
         if 'Please enter your login details' in await page.content():
-            if not await do_login():
-                return None
+            # Re-login
+            await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
+            await asyncio.sleep(1)
+            u = page.locator('input[type="text"]').first
+            await u.click()
+            for c in PANEL_USER: await u.type(c, delay=30)
+            await asyncio.sleep(0.3)
+            p = page.locator('input[type="password"]').first
+            await p.click()
+            for c in PANEL_PASS: await p.type(c, delay=30)
+            await asyncio.sleep(0.3)
+            await page.locator('button, input[type="submit"]').first.click()
+            await asyncio.sleep(1.5)
+            await save_cookies()
             await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
             await asyncio.sleep(0.8)
+        
         rows = page.locator('table tbody tr')
-        n = await rows.count()
-        if n == 0:
-            return []
-        for i in range(n):
+        total = await rows.count()
+        for i in range(total):
             row = rows.nth(i)
             cols = row.locator('td')
-            if await cols.count() < 5:
-                continue
-            number = (await cols.nth(0).inner_text()).strip()
-            if not number:
-                continue
+            if await cols.count() < 5: continue
+            num = (await cols.nth(0).inner_text()).strip()
+            if num not in assigned: continue  # Sirf assigned check
+            
             form = row.locator('form').first
             clicked = False
             if await form.count() > 0:
-                try:
-                    await form.click()
-                    clicked = True
-                except:
-                    pass
+                try: await form.click(); clicked = True
+                except: pass
             if not clicked:
                 btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
                 if await btn.count() > 0:
-                    try:
-                        await btn.click()
-                        clicked = True
-                    except:
-                        pass
+                    try: await btn.click(); clicked = True
+                    except: pass
             if clicked:
                 try:
                     await page.wait_for_load_state('domcontentloaded', timeout=8000)
                     await asyncio.sleep(1)
-                    detail_rows = page.locator('table tbody tr')
-                    for j in range(await detail_rows.count()):
-                        d_cols = detail_rows.nth(j).locator('td')
-                        if await d_cols.count() >= 5:
-                            dt = (await d_cols.nth(0).inner_text()).strip()
-                            ph = (await d_cols.nth(1).inner_text()).strip()
-                            se = (await d_cols.nth(2).inner_text()).strip()
-                            ms = (await d_cols.nth(-1).inner_text()).strip()
+                    dr = page.locator('table tbody tr')
+                    for j in range(await dr.count()):
+                        dc = dr.nth(j).locator('td')
+                        if await dc.count() >= 5:
+                            dt = (await dc.nth(0).inner_text()).strip()
+                            ph = (await dc.nth(1).inner_text()).strip()
+                            se = (await dc.nth(2).inner_text()).strip()
+                            ms = (await dc.nth(-1).inner_text()).strip()
                             if ms and len(ms) > 3 and dt:
-                                all_messages.append({"datetime":dt,"phone":ph,"sender":se,"message":ms})
+                                all_msgs.append({"datetime":dt,"phone":ph,"sender":se,"message":ms})
                     await page.go_back()
                     await page.wait_for_load_state('domcontentloaded', timeout=8000)
                     await asyncio.sleep(0.5)
@@ -236,323 +211,193 @@ async def get_all_messages():
                     try:
                         await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
                         await asyncio.sleep(0.5)
-                    except:
-                        pass
-        if random.random() < 0.2:
-            await save_cookies()
-        return all_messages
-    except Exception:
-        return None
+                    except: pass
+        if random.random() < 0.2: await save_cookies()
+        return all_msgs
+    except:
+        return []
 
-# ========== POLL LOOP RUNS IN SEPARATE THREAD ✅ ==========
-def poll_thread_func():
-    """Alag thread mein chalega — Telegram bot ko bilkul block nahi karega"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    async def poll_loop():
-        global seen_messages
-        print(f"POLLING STARTED (separate thread) | {POLL_INTERVAL}s", flush=True)
-        err = 0
-        cleanup_counter = 0
-        
-        await playwright_setup()
-        if not await is_logged_in():
-            await do_login()
-        
-        while True:
-            try:
-                msgs = await get_all_messages()
-                assignments, numbers, active_otps = load_data()
-                
-                cleanup_counter += 1
-                if cleanup_counter >= 5:
-                    cleanup_counter = 0
-                    freed, users = cleanup_expired(assignments, active_otps)
-                    if freed > 0:
-                        print(f"FREED: {freed} numbers ({users} users)", flush=True)
-                        save_data(assignments, numbers, active_otps)
-                
-                if msgs is None:
-                    err += 1
-                    if err >= 5 and bot_instance:
-                        asyncio.run_coroutine_threadsafe(
-                            safe_send(bot_instance, ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin"),
-                            bot_instance._loop if hasattr(bot_instance, '_loop') else asyncio.get_event_loop()
-                        )
-                        err = 0
-                else:
-                    err = 0
-                    for m in msgs:
-                        key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
-                        if key not in seen_messages:
-                            seen_messages.add(key)
-                            # Send via main bot loop
-                            if bot_instance:
-                                asyncio.run_coroutine_threadsafe(
-                                    send_otp_from_thread(bot_instance, m, assignments, active_otps),
-                                    bot_instance._loop if hasattr(bot_instance, '_loop') else asyncio.get_event_loop()
-                                )
-                            active_otps = mark_number_active(m['phone'], active_otps)
-                    save_data(assignments, numbers, active_otps)
-                
-                if len(seen_messages) > 500:
-                    seen_messages = set(list(seen_messages)[-250:])
-            except Exception as e:
-                print(f"Poll error: {e}", flush=True)
-            
-            await asyncio.sleep(max(5, POLL_INTERVAL))
-    
-    loop.run_until_complete(poll_loop())
-
-async def send_otp_from_thread(bot, msg, assignments, active_otps):
-    """OTP bhejne ka kaam main bot loop mein hoga"""
+async def send_otp(bot, msg, a, o):
     otp = extract_otp(msg['message'])
-    masked = mask_phone(msg['phone'])
+    masked_num = mask(msg['phone'])
     full = msg['phone']
-    
-    channel_text = (
-        f"🔐 NEW OTP RECEIVED\n"
-        f"📱 Phone: `{masked}`\n"
-        f"🕐 Time: {msg['datetime']}\n"
-        f"✉️ Sender: `{msg['sender']}`\n"
-        f"🔢 Code: `{otp}`\n"
-        f"📝 Message:\n`{msg['message'][:300]}`"
-    )
-    
-    await safe_send(bot, CHANNEL_ID, channel_text)
-    await safe_send(bot, NEW_CHANNEL_ID, channel_text)
-    
-    user_id = None
-    for uid, data in assignments.items():
-        if full in data["numbers"]:
-            user_id = int(uid)
-            break
-    
-    if user_id:
-        dm_text = (
-            f"🔐 YOUR OTP ARRIVED ✅\n\n"
-            f"📱 Number: `{full}`\n"
-            f"🕐 Time: {msg['datetime']}\n"
-            f"✉️ Sender: `{msg['sender']}`\n"
-            f"🔢 OTP Code: `{otp}`\n\n"
-            f"📝 Full Message:\n`{msg['message'][:300]}`"
-        )
-        await safe_send(bot, user_id, dm_text)
-    
-    print(f"OTP: {masked} | {otp}", flush=True)
+    o[full] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ct = f"🔐 NEW OTP RECEIVED\n📱 Phone: `{masked_num}`\n🕐 Time: {msg['datetime']}\n✉️ Sender: `{msg['sender']}`\n🔢 Code: `{otp}`\n📝 Message:\n`{msg['message'][:300]}`"
+    await safe_send(bot, CHANNEL_ID, ct)
+    await safe_send(bot, NEW_CHANNEL_ID, ct)
+    uid = None
+    for u, d in a.items():
+        if full in d["numbers"]:
+            uid = int(u); break
+    if uid:
+        dm = f"🔐 YOUR OTP ARRIVED ✅\n\n📱 Number: `{full}`\n🕐 Time: {msg['datetime']}\n✉️ Sender: `{msg['sender']}`\n🔢 OTP Code: `{otp}`\n\n📝 Full Message:\n`{msg['message'][:300]}`"
+        await safe_send(bot, uid, dm)
+    print(f"OTP: {masked_num} | {otp}", flush=True)
 
-# ========== USER COMMANDS — INSTANT ✅ ==========
+async def poll_loop(bot):
+    global seen_messages
+    err = 0; cc = 0
+    while True:
+        try:
+            msgs = await fetch_otps()
+            a, n, o = load_data()
+            cc += 1
+            if cc >= 5:
+                cc = 0
+                freed, users = cleanup_expired(a, o)
+                if freed > 0:
+                    print(f"FREED: {freed} numbers ({users} users)", flush=True)
+                    save_data(a, n, o)
+            if msgs is None:
+                err += 1
+                if err >= 5:
+                    await safe_send(bot, ADMIN_ID, "⚠️ FETCH FAILING")
+                    err = 0
+            else:
+                err = 0
+                for m in msgs:
+                    key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
+                    if key not in seen_messages:
+                        seen_messages.add(key)
+                        await send_otp(bot, m, a, o)
+                save_data(a, n, o)
+            if len(seen_messages) > 500:
+                seen_messages = set(list(seen_messages)[-250:])
+        except Exception as e:
+            print(f"Poll err: {e}", flush=True)
+        await asyncio.sleep(POLL_INTERVAL)
+
+# ========== COMMANDS ==========
 async def start_cmd(u: Update, c: ContextTypes):
-    user_id = u.effective_user.id
+    uid = u.effective_user.id
     name = u.effective_user.first_name
-    assignments, numbers, active_otps = load_data()
-    if not numbers:
+    a, n, o = load_data()
+    if not n:
         await u.message.reply_text("⚠️ Numbers abhi upload nahi hue! Admin jald karega 🙏", parse_mode="Markdown")
         return
-    user_nums, is_new = assign_numbers(user_id, assignments, numbers, active_otps)
-    if user_nums is None:
-        await u.message.reply_text("😔 Saare numbers use ho chuke! Jaldi expire honge — try again 🙏", parse_mode="Markdown")
+    nums, is_new = assign_nums(uid, a, n, o)
+    if nums is None:
+        await u.message.reply_text("😔 Saare numbers use ho chuke! Jaldi expire honge 🙏", parse_mode="Markdown")
         return
-    nums_text = "\n".join([f"  {i+1}. `{num}`" for i, num in enumerate(user_nums)])
+    nt = "\n".join([f"  {i+1}. `{x}`" for i, x in enumerate(nums)])
     if is_new:
-        await u.message.reply_text(
-            f"🎉 Welcome {name}!\n\n✅ Tere {len(user_nums)} numbers:\n{nums_text}\n\n"
-            f"⏰ 10min mein OTP aaya → permanent tera!\n"
-            f"❌ Nahi aaya → /refresh se naye le\n\n🔄 Naye chahiye? /refresh",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text(f"🎉 Welcome {name}!\n\n✅ Tere {len(nums)} numbers:\n{nt}\n\n⏰ 10min mein OTP aaya → permanent!\n❌ Nahi aaya → /refresh\n\n🔄 /refresh | 📱 /mynumber", parse_mode="Markdown")
     else:
-        await u.message.reply_text(
-            f"👋 Welcome back {name}!\n\n📱 Tere numbers:\n{nums_text}\n\n🔄 Naye chahiye? /refresh",
-            parse_mode="Markdown"
-        )
+        await u.message.reply_text(f"👋 Welcome back {name}!\n\n📱 Tere numbers:\n{nt}\n\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
 
 async def mynumber_cmd(u: Update, c: ContextTypes):
-    user_id = u.effective_user.id
-    assignments, _, active_otps = load_data()
-    if str(user_id) in assignments:
-        data = assignments[str(user_id)]
-        nums_text = ""
-        for i, num in enumerate(data["numbers"]):
-            status = "✅ LOCKED" if num in active_otps else "⏳ Waiting"
-            nums_text += f"  {i+1}. `{num}` — {status}\n"
-        await u.message.reply_text(f"📱 Tere Numbers:\n{nums_text}\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
+    uid = str(u.effective_user.id)
+    a, _, o = load_data()
+    if uid in a:
+        nt = ""
+        for i, x in enumerate(a[uid]["numbers"]):
+            st = "✅ LOCKED" if x in o else "⏳ Waiting"
+            nt += f"  {i+1}. `{x}` — {st}\n"
+        await u.message.reply_text(f"📱 Tere Numbers:\n{nt}\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
     else:
         await u.message.reply_text("❌ Pehle /start karein", parse_mode="Markdown")
 
 async def refresh_cmd(u: Update, c: ContextTypes):
-    user_id = u.effective_user.id
-    assignments, numbers, active_otps = load_data()
-    if str(user_id) not in assignments:
-        await u.message.reply_text("❌ Pehle /start use karein!")
+    uid = str(u.effective_user.id)
+    a, n, o = load_data()
+    if uid not in a:
+        await u.message.reply_text("❌ Pehle /start karein!")
         return
-    old_data = assignments[str(user_id)]
-    old_nums = old_data["numbers"]
-    if any(num in active_otps for num in old_nums):
+    old = a[uid]
+    if any(x in o for x in old["numbers"]):
         await u.message.reply_text("✅ Tere number par OTP aaya hai — permanent tera hai ✅", parse_mode="Markdown")
         return
-    del assignments[str(user_id)]
-    new_nums, _ = assign_numbers(user_id, assignments, numbers, active_otps)
-    if new_nums is None:
-        assignments[str(user_id)] = {"numbers": old_nums, "assigned_at": old_data["assigned_at"]}
-        save_data(assignments, numbers, active_otps)
+    del a[uid]
+    new, _ = assign_nums(uid, a, n, o)
+    if new is None:
+        a[uid] = old; save_data(a, n, o)
         await u.message.reply_text("😔 Naye numbers nahi available!")
         return
-    nums_text = "\n".join([f"  {i+1}. `{num}`" for i, num in enumerate(new_nums)])
-    await u.message.reply_text(f"🔄 Refreshed!\n✅ Naye numbers:\n{nums_text}", parse_mode="Markdown")
+    nt = "\n".join([f"  {i+1}. `{x}`" for i, x in enumerate(new)])
+    await u.message.reply_text(f"🔄 Refreshed!\n✅ Naye numbers:\n{nt}", parse_mode="Markdown")
 
-# ========== ADMIN COMMANDS ==========
-async def upload_numbers_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
+async def upload_cmd(u: Update, c: ContextTypes):
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
     if not u.message.text or len(u.message.text.split()) < 2:
-        await u.message.reply_text("📝 Use: `/uploadnumbers +591xxx, +591yyy...`", parse_mode="Markdown")
-        return
-    text = u.message.text.replace('/uploadnumbers', '').strip()
-    new_nums = [n.strip() for n in re.split(r'[,\n]+', text) if n.strip().startswith('+')]
-    if not new_nums:
-        await u.message.reply_text("❌ Koi valid number nahi mila!")
-        return
-    assignments, existing, active_otps = load_data()
-    added = sum(1 for n in new_nums if n not in existing)
-    existing.extend(n for n in new_nums if n not in existing)
-    save_data(assignments, existing, active_otps)
-    avail = len(get_available_numbers(assignments, existing))
-    await u.message.reply_text(f"✅ Uploaded!\nNaye: {added} | Total: {len(existing)} | Available: {avail} | Locked: {len(active_otps)}", parse_mode="Markdown")
+        return await u.message.reply_text("📝 `/uploadnumbers +591xxx, +591yyy...`", parse_mode="Markdown")
+    txt = u.message.text.replace('/uploadnumbers', '').strip()
+    nn = [x.strip() for x in re.split(r'[,\n]+', txt) if x.strip().startswith('+')]
+    if not nn: return await u.message.reply_text("❌ Koi valid number nahi!")
+    a, ex, o = load_data()
+    added = sum(1 for x in nn if x not in ex)
+    ex.extend(x for x in nn if x not in ex)
+    save_data(a, ex, o)
+    avail = len(get_available(a, ex))
+    await u.message.reply_text(f"✅ Uploaded!\nNaye: {added} | Total: {len(ex)} | Available: {avail} | Locked: {len(o)}", parse_mode="Markdown")
 
 async def freeuser_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    parts = u.message.text.split()
-    if len(parts) < 2:
-        await u.message.reply_text("Use: `/freeuser user_id`")
-        return
-    target = parts[1].strip()
-    assignments, numbers, active_otps = load_data()
-    freed = free_user_numbers(target, assignments, numbers, active_otps)
-    await u.message.reply_text(f"✅ Freed: {freed}" if freed else "❌ Nahi mila!")
-
-async def freenumber_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    parts = u.message.text.split()
-    if len(parts) < 2:
-        await u.message.reply_text("Use: `/freenumber +591xxxx`")
-        return
-    target = parts[1].strip()
-    assignments, numbers, active_otps = load_data()
-    found = False
-    for uid, data in list(assignments.items()):
-        if target in data["numbers"]:
-            data["numbers"].remove(target)
-            found = True
-            if not data["numbers"]:
-                del assignments[uid]
-            break
-    if found:
-        save_data(assignments, numbers, active_otps)
-        await u.message.reply_text("✅ Freed!")
-    else:
-        await u.message.reply_text("❌ Nahi mila!")
-
-async def cleanunused_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    assignments, numbers, active_otps = load_data()
-    freed, users = cleanup_expired(assignments, active_otps)
-    save_data(assignments, numbers, active_otps)
-    await u.message.reply_text(f"✅ Cleaned!\nFreed: {freed} | Users: {users}", parse_mode="Markdown")
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    p = u.message.text.split()
+    if len(p) < 2: return await u.message.reply_text("Use: `/freeuser user_id`")
+    a, n, o = load_data()
+    t = p[1].strip()
+    if t in a:
+        f = len(a[t]["numbers"]); del a[t]; save_data(a, n, o)
+        await u.message.reply_text(f"✅ Freed: {f}")
+    else: await u.message.reply_text("❌ Nahi mila!")
 
 async def stats_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    assignments, numbers, active_otps = load_data()
-    avail = len(get_available_numbers(assignments, numbers))
-    await u.message.reply_text(
-        f"📊 Stats:\nTotal: {len(numbers)} | Available: {avail}\nUsers: {len(assignments)} | Locked: {len(active_otps)}",
-        parse_mode="Markdown"
-    )
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    a, n, o = load_data()
+    pw_status = "✅ Ready" if pw_ready else "⏳ Loading..."
+    await u.message.reply_text(f"📊 Total: {len(n)} | Available: {len(get_available(a,n))} | Users: {len(a)} | Locked: {len(o)}\n🌐 Browser: {pw_status}", parse_mode="Markdown")
 
 async def clearseen_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    global seen_messages
-    seen_messages = set()
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    global seen_messages; seen_messages = set()
     await u.message.reply_text("✅ Cleared!")
 
 async def relogin_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
     try: os.remove(cookies_file)
     except: pass
-    await u.message.reply_text("✅ Cookie deleted — next poll mein auto re-login hoga")
+    await u.message.reply_text("✅ Cookie deleted — auto re-login next poll")
 
 async def status_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    await u.message.reply_text("✅ Bot running | Polling alag thread mein active")
+    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    pw_status = "✅ Ready" if pw_ready else "⏳ Loading..."
+    await u.message.reply_text(f"✅ Bot running\n🌐 Browser: {pw_status}")
 
-async def testfetch_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID:
-        await u.message.reply_text("❌ Admin only!")
-        return
-    await u.message.reply_text("✅ Bot working — polling background mein chal raha hai")
-
-# ========== MAIN ==========
+# ========== MAIN — BOT PEHLE START HOGA ⚡ ==========
 async def main():
-    global bot_instance
-    
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN missing!", flush=True)
-        return
+        print("❌ BOT_TOKEN missing!", flush=True); return
     
-    assignments, numbers, active_otps = load_data()
-    save_data(assignments, numbers, active_otps)
-    print(f"LOADED: {len(numbers)} numbers | {len(assignments)} users", flush=True)
+    a, n, o = load_data(); save_data(a, n, o)
+    print(f"LOADED: {len(n)} numbers | {len(a)} users", flush=True)
     
+    # ✅ STEP 1: Telegram bot TURANT start — commands instant
     app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).build()
-    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("mynumber", mynumber_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
-    app.add_handler(CommandHandler("uploadnumbers", upload_numbers_cmd))
+    app.add_handler(CommandHandler("uploadnumbers", upload_cmd))
     app.add_handler(CommandHandler("freeuser", freeuser_cmd))
-    app.add_handler(CommandHandler("freenumber", freenumber_cmd))
-    app.add_handler(CommandHandler("cleanunused", cleanunused_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("clearseen", clearseen_cmd))
     app.add_handler(CommandHandler("relogin", relogin_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("testfetch", testfetch_cmd))
     
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    # ✅ Set bot instance for the poll thread
-    bot_instance = app.bot
-    bot_instance._loop = asyncio.get_event_loop()
+    print("✅ BOT ONLINE — /start turant kaam karega ⚡", flush=True)
     
-    # ✅ KEY FIX: Playwright polling ALAG THREAD mein → Telegram commands INSTANT
-    poll_thread = threading.Thread(target=poll_thread_func, daemon=True)
-    poll_thread.start()
+    # ✅ STEP 2: Playwright BACKGROUND mein setup hoga — bot ko block nahi karega
+    asyncio.create_task(pw_setup_and_login())
     
-    print("✅ BOT ONLINE — Commands INSTANT ⚡ (Playwright alag thread mein)", flush=True)
+    # ✅ STEP 3: Poll loop bhi background mein (Playwright ready hone ke baad hi kaam karega)
+    asyncio.create_task(poll_loop(app.bot))
     
-    # Keep main bot loop running
+    # Keep running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("STOPPED", flush=True)
+    try: asyncio.run(main())
+    except KeyboardInterrupt: print("STOPPED", flush=True)
