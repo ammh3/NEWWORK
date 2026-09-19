@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -25,13 +26,13 @@ ASSIGNMENTS_FILE = "user_assignments.json"
 NUMBERS_FILE     = "panel_numbers.json"
 ACTIVE_OTPS_FILE = "active_otp_numbers.json"
 
-browser = None
-context = None
-page = None
 seen_messages = set()
 cookies_file = "panel_cookies.json"
 
-# ========== SAFE SEND — RETRY + NO CRASH ✅ ==========
+# Shared bot reference (set after app starts)
+bot_instance = None
+
+# ========== SAFE SEND ==========
 async def safe_send(bot, chat_id, text):
     for attempt in range(3):
         try:
@@ -113,9 +114,17 @@ def mask_phone(phone):
     phone = phone.strip()
     return phone if len(phone) <= 6 else f"{phone[:4]}*****{phone[-3:]}"
 
-# ========== BROWSER ==========
-async def setup_browser():
-    global browser, context, page
+def extract_otp(txt):
+    m = re.search(r'\b(\d{4,8})\b', txt)
+    return m.group(1) if m else "N/A"
+
+# ========== PLAYWRIGHT IN SEPARATE THREAD ✅ ==========
+# Yeh poora Playwright kaam alag thread mein chalega
+# Telegram bot ka event loop bilkul free rahega → INSTANT commands
+
+browser_state = {"page": None, "context": None, "browser": None}
+
+async def playwright_setup():
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
         headless=True,
@@ -131,12 +140,16 @@ async def setup_browser():
     try:
         with open(cookies_file) as f: await context.add_cookies(json.load(f))
     except: pass
+    browser_state["page"] = page
+    browser_state["context"] = context
+    browser_state["browser"] = browser
     return page
 
 async def save_cookies():
-    with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+    with open(cookies_file,'w') as f: json.dump(await browser_state["context"].cookies(), f)
 
 async def is_logged_in():
+    page = browser_state["page"]
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
         await asyncio.sleep(0.5)
@@ -144,6 +157,7 @@ async def is_logged_in():
     except: return False
 
 async def do_login():
+    page = browser_state["page"]
     try:
         await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
         await asyncio.sleep(1)
@@ -162,21 +176,21 @@ async def do_login():
     except:
         return False
 
-# ========== OTP FETCH ==========
 async def get_all_messages():
+    page = browser_state["page"]
     all_messages = []
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
         await asyncio.sleep(0.8)
         if 'Please enter your login details' in await page.content():
             if not await do_login():
-                return None, "login_fail"
+                return None
             await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
             await asyncio.sleep(0.8)
         rows = page.locator('table tbody tr')
         n = await rows.count()
         if n == 0:
-            return [], "empty"
+            return []
         for i in range(n):
             row = rows.nth(i)
             cols = row.locator('td')
@@ -226,20 +240,76 @@ async def get_all_messages():
                         pass
         if random.random() < 0.2:
             await save_cookies()
-        return all_messages, "ok"
+        return all_messages
     except Exception:
-        return None, "error"
+        return None
 
-def extract_otp(txt):
-    m = re.search(r'\b(\d{4,8})\b', txt)
-    return m.group(1) if m else "N/A"
+# ========== POLL LOOP RUNS IN SEPARATE THREAD ✅ ==========
+def poll_thread_func():
+    """Alag thread mein chalega — Telegram bot ko bilkul block nahi karega"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def poll_loop():
+        global seen_messages
+        print(f"POLLING STARTED (separate thread) | {POLL_INTERVAL}s", flush=True)
+        err = 0
+        cleanup_counter = 0
+        
+        await playwright_setup()
+        if not await is_logged_in():
+            await do_login()
+        
+        while True:
+            try:
+                msgs = await get_all_messages()
+                assignments, numbers, active_otps = load_data()
+                
+                cleanup_counter += 1
+                if cleanup_counter >= 5:
+                    cleanup_counter = 0
+                    freed, users = cleanup_expired(assignments, active_otps)
+                    if freed > 0:
+                        print(f"FREED: {freed} numbers ({users} users)", flush=True)
+                        save_data(assignments, numbers, active_otps)
+                
+                if msgs is None:
+                    err += 1
+                    if err >= 5 and bot_instance:
+                        asyncio.run_coroutine_threadsafe(
+                            safe_send(bot_instance, ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin"),
+                            bot_instance._loop if hasattr(bot_instance, '_loop') else asyncio.get_event_loop()
+                        )
+                        err = 0
+                else:
+                    err = 0
+                    for m in msgs:
+                        key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
+                        if key not in seen_messages:
+                            seen_messages.add(key)
+                            # Send via main bot loop
+                            if bot_instance:
+                                asyncio.run_coroutine_threadsafe(
+                                    send_otp_from_thread(bot_instance, m, assignments, active_otps),
+                                    bot_instance._loop if hasattr(bot_instance, '_loop') else asyncio.get_event_loop()
+                                )
+                            active_otps = mark_number_active(m['phone'], active_otps)
+                    save_data(assignments, numbers, active_otps)
+                
+                if len(seen_messages) > 500:
+                    seen_messages = set(list(seen_messages)[-250:])
+            except Exception as e:
+                print(f"Poll error: {e}", flush=True)
+            
+            await asyncio.sleep(max(5, POLL_INTERVAL))
+    
+    loop.run_until_complete(poll_loop())
 
-# ========== SEND OTP ==========
-async def send_otp(bot, msg, assignments, active_otps):
+async def send_otp_from_thread(bot, msg, assignments, active_otps):
+    """OTP bhejne ka kaam main bot loop mein hoga"""
     otp = extract_otp(msg['message'])
     masked = mask_phone(msg['phone'])
     full = msg['phone']
-    active_otps = mark_number_active(full, active_otps)
     
     channel_text = (
         f"🔐 NEW OTP RECEIVED\n"
@@ -271,47 +341,8 @@ async def send_otp(bot, msg, assignments, active_otps):
         await safe_send(bot, user_id, dm_text)
     
     print(f"OTP: {masked} | {otp}", flush=True)
-    return active_otps
 
-# ========== POLL LOOP — BACKGROUND ✅ ==========
-async def poll_loop(bot):
-    global seen_messages
-    print(f"POLLING STARTED | {POLL_INTERVAL}s | Auto-free: {EXPIRE_MINUTES}min", flush=True)
-    err = 0
-    cleanup_counter = 0
-    
-    while True:
-        msgs, _ = await get_all_messages()
-        assignments, numbers, active_otps = load_data()
-        
-        cleanup_counter += 1
-        if cleanup_counter >= 5:
-            cleanup_counter = 0
-            freed, users = cleanup_expired(assignments, active_otps)
-            if freed > 0:
-                print(f"FREED: {freed} numbers ({users} users)", flush=True)
-                save_data(assignments, numbers, active_otps)
-        
-        if msgs is None:
-            err += 1
-            if err >= 5:
-                await safe_send(bot, ADMIN_ID, "⚠️ FETCH FAILING\nUse /relogin")
-                err = 0
-        else:
-            err = 0
-            for m in msgs:
-                key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
-                if key not in seen_messages:
-                    seen_messages.add(key)
-                    active_otps = await send_otp(bot, m, assignments, active_otps)
-            save_data(assignments, numbers, active_otps)
-        
-        if len(seen_messages) > 500:
-            seen_messages = set(list(seen_messages)[-250:])
-        
-        await asyncio.sleep(max(5, POLL_INTERVAL))
-
-# ========== USER COMMANDS — INSTANT RESPONSE ✅ ==========
+# ========== USER COMMANDS — INSTANT ✅ ==========
 async def start_cmd(u: Update, c: ContextTypes):
     user_id = u.effective_user.id
     name = u.effective_user.first_name
@@ -462,35 +493,31 @@ async def relogin_cmd(u: Update, c: ContextTypes):
         return
     try: os.remove(cookies_file)
     except: pass
-    ok = await do_login()
-    await u.message.reply_text("✅ Done" if ok else "❌ Failed")
+    await u.message.reply_text("✅ Cookie deleted — next poll mein auto re-login hoga")
 
 async def status_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
-    msgs, _ = await get_all_messages()
-    await u.message.reply_text(f"✅ Working\nMessages: {len(msgs) if msgs else 0}")
+    await u.message.reply_text("✅ Bot running | Polling alag thread mein active")
 
 async def testfetch_cmd(u: Update, c: ContextTypes):
     if u.effective_user.id != ADMIN_ID:
         await u.message.reply_text("❌ Admin only!")
         return
-    msgs, _ = await get_all_messages()
-    await u.message.reply_text(f"✅ {len(msgs)} found" if msgs else "❌ Nothing")
+    await u.message.reply_text("✅ Bot working — polling background mein chal raha hai")
 
-# ========== MAIN — BACKGROUND POLLING = INSTANT COMMANDS ✅ ==========
+# ========== MAIN ==========
 async def main():
+    global bot_instance
+    
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing!", flush=True)
         return
+    
     assignments, numbers, active_otps = load_data()
     save_data(assignments, numbers, active_otps)
     print(f"LOADED: {len(numbers)} numbers | {len(assignments)} users", flush=True)
-    
-    await setup_browser()
-    if not await is_logged_in():
-        await do_login()
     
     app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).build()
     
@@ -511,12 +538,17 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    # ✅ KEY: Polling background mein → commands instant
-    asyncio.create_task(poll_loop(app.bot))
+    # ✅ Set bot instance for the poll thread
+    bot_instance = app.bot
+    bot_instance._loop = asyncio.get_event_loop()
     
-    print("✅ BOT ONLINE — Commands INSTANT respond karenge ⚡", flush=True)
+    # ✅ KEY FIX: Playwright polling ALAG THREAD mein → Telegram commands INSTANT
+    poll_thread = threading.Thread(target=poll_thread_func, daemon=True)
+    poll_thread.start()
     
-    # Keep running forever
+    print("✅ BOT ONLINE — Commands INSTANT ⚡ (Playwright alag thread mein)", flush=True)
+    
+    # Keep main bot loop running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
