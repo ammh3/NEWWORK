@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import threading
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -24,13 +25,9 @@ ASSIGNMENTS_FILE = "user_assignments.json"
 NUMBERS_FILE     = "panel_numbers.json"
 ACTIVE_OTPS_FILE = "active_otp_numbers.json"
 cookies_file = "panel_cookies.json"
-seen_messages = set()
 
-# Playwright state — ready hone tak None rahega
-pw_ready = False
-page = None
-context = None
-browser = None
+main_loop = None
+bot_ref = None
 
 async def safe_send(bot, chat_id, text):
     for _ in range(3):
@@ -40,6 +37,10 @@ async def safe_send(bot, chat_id, text):
         except Exception:
             await asyncio.sleep(2)
     return False
+
+def send_to_main(chat_id, text):
+    if bot_ref and main_loop:
+        asyncio.run_coroutine_threadsafe(safe_send(bot_ref, chat_id, text), main_loop)
 
 def load_data():
     a, n, o = {}, [], {}
@@ -97,64 +98,33 @@ def extract_otp(t):
     m = re.search(r'\b(\d{4,8})\b', t)
     return m.group(1) if m else "N/A"
 
-# ========== PLAYWRIGHT — BACKGROUND MEIN SETUP HOGA ==========
-async def pw_setup_and_login():
-    global pw_ready, page, context, browser
-    try:
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
-        context = await browser.new_context(viewport={'width':1366,'height':768}, user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36')
-        page = await context.new_page()
+# ========== PLAYWRIGHT THREAD — AUTO-RESTART ✅ ==========
+def playwright_thread():
+    while True:  # ✅ Crash ho toh auto-restart
         try:
-            with open(cookies_file) as f: await context.add_cookies(json.load(f))
-        except: pass
-        
-        # Login
-        try:
-            await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
-            await asyncio.sleep(0.5)
-            if 'Please enter your login details' in await page.content():
-                await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
-                await asyncio.sleep(1)
-                u = page.locator('input[type="text"]').first
-                await u.click()
-                for c in PANEL_USER: await u.type(c, delay=30)
-                await asyncio.sleep(0.3)
-                p = page.locator('input[type="password"]').first
-                await p.click()
-                for c in PANEL_PASS: await p.type(c, delay=30)
-                await asyncio.sleep(0.3)
-                await page.locator('button, input[type="submit"]').first.click()
-                await asyncio.sleep(1.5)
-                with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
-        except: pass
-        
-        pw_ready = True
-        print("✅ Playwright ready — OTP polling shuru", flush=True)
-    except Exception as e:
-        print(f"Playwright setup error: {e}", flush=True)
-        # Retry after 10 sec
-        await asyncio.sleep(10)
-        asyncio.create_task(pw_setup_and_login())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(pw_run())
+        except Exception as e:
+            print(f"THREAD CRASHED: {e} — restarting in 10s...", flush=True)
+            send_to_main(ADMIN_ID, f"⚠️ Playwright thread crashed, restarting...")
+            import time; time.sleep(10)
 
-async def save_cookies():
+async def pw_run():
+    seen = set()
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
+    context = await browser.new_context(viewport={'width':1366,'height':768}, user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36')
+    page = await context.new_page()
     try:
-        with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+        with open(cookies_file) as f: await context.add_cookies(json.load(f))
     except: pass
-
-async def fetch_otps():
-    if not pw_ready or page is None:
-        return []
-    a, n, o = load_data()
-    assigned = get_assigned(a)
-    if not assigned:
-        return []
-    all_msgs = []
+    
+    # Login
     try:
         await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.5)
         if 'Please enter your login details' in await page.content():
-            # Re-login
             await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
             await asyncio.sleep(1)
             u = page.locator('input[type="text"]').first
@@ -167,80 +137,19 @@ async def fetch_otps():
             await asyncio.sleep(0.3)
             await page.locator('button, input[type="submit"]').first.click()
             await asyncio.sleep(1.5)
-            await save_cookies()
-            await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
-            await asyncio.sleep(0.8)
-        
-        rows = page.locator('table tbody tr')
-        total = await rows.count()
-        for i in range(total):
-            row = rows.nth(i)
-            cols = row.locator('td')
-            if await cols.count() < 5: continue
-            num = (await cols.nth(0).inner_text()).strip()
-            if num not in assigned: continue  # Sirf assigned check
-            
-            form = row.locator('form').first
-            clicked = False
-            if await form.count() > 0:
-                try: await form.click(); clicked = True
-                except: pass
-            if not clicked:
-                btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
-                if await btn.count() > 0:
-                    try: await btn.click(); clicked = True
-                    except: pass
-            if clicked:
-                try:
-                    await page.wait_for_load_state('domcontentloaded', timeout=8000)
-                    await asyncio.sleep(1)
-                    dr = page.locator('table tbody tr')
-                    for j in range(await dr.count()):
-                        dc = dr.nth(j).locator('td')
-                        if await dc.count() >= 5:
-                            dt = (await dc.nth(0).inner_text()).strip()
-                            ph = (await dc.nth(1).inner_text()).strip()
-                            se = (await dc.nth(2).inner_text()).strip()
-                            ms = (await dc.nth(-1).inner_text()).strip()
-                            if ms and len(ms) > 3 and dt:
-                                all_msgs.append({"datetime":dt,"phone":ph,"sender":se,"message":ms})
-                    await page.go_back()
-                    await page.wait_for_load_state('domcontentloaded', timeout=8000)
-                    await asyncio.sleep(0.5)
-                except:
-                    try:
-                        await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
-                        await asyncio.sleep(0.5)
-                    except: pass
-        if random.random() < 0.2: await save_cookies()
-        return all_msgs
-    except:
-        return []
-
-async def send_otp(bot, msg, a, o):
-    otp = extract_otp(msg['message'])
-    masked_num = mask(msg['phone'])
-    full = msg['phone']
-    o[full] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ct = f"🔐 NEW OTP RECEIVED\n📱 Phone: `{masked_num}`\n🕐 Time: {msg['datetime']}\n✉️ Sender: `{msg['sender']}`\n🔢 Code: `{otp}`\n📝 Message:\n`{msg['message'][:300]}`"
-    await safe_send(bot, CHANNEL_ID, ct)
-    await safe_send(bot, NEW_CHANNEL_ID, ct)
-    uid = None
-    for u, d in a.items():
-        if full in d["numbers"]:
-            uid = int(u); break
-    if uid:
-        dm = f"🔐 YOUR OTP ARRIVED ✅\n\n📱 Number: `{full}`\n🕐 Time: {msg['datetime']}\n✉️ Sender: `{msg['sender']}`\n🔢 OTP Code: `{otp}`\n\n📝 Full Message:\n`{msg['message'][:300]}`"
-        await safe_send(bot, uid, dm)
-    print(f"OTP: {masked_num} | {otp}", flush=True)
-
-async def poll_loop(bot):
-    global seen_messages
+            with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+    except Exception as e:
+        print(f"Login err: {e}", flush=True)
+    
+    print("✅ Playwright ready — polling shuru", flush=True)
+    send_to_main(ADMIN_ID, "✅ Bot ready — OTP polling shuru")
+    
     err = 0; cc = 0
     while True:
         try:
-            msgs = await fetch_otps()
             a, n, o = load_data()
+            assigned = get_assigned(a)
+            
             cc += 1
             if cc >= 5:
                 cc = 0
@@ -248,42 +157,142 @@ async def poll_loop(bot):
                 if freed > 0:
                     print(f"FREED: {freed} numbers ({users} users)", flush=True)
                     save_data(a, n, o)
-            if msgs is None:
-                err += 1
-                if err >= 5:
-                    await safe_send(bot, ADMIN_ID, "⚠️ FETCH FAILING")
-                    err = 0
+            
+            if assigned:
+                await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+                await asyncio.sleep(0.8)
+                if 'Please enter your login details' in await page.content():
+                    await page.goto(LOGIN_URL, timeout=20000, wait_until='networkidle')
+                    await asyncio.sleep(1)
+                    u = page.locator('input[type="text"]').first
+                    await u.click()
+                    for c in PANEL_USER: await u.type(c, delay=30)
+                    await asyncio.sleep(0.3)
+                    p = page.locator('input[type="password"]').first
+                    await p.click()
+                    for c in PANEL_PASS: await p.type(c, delay=30)
+                    await asyncio.sleep(0.3)
+                    await page.locator('button, input[type="submit"]').first.click()
+                    await asyncio.sleep(1.5)
+                    with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+                    await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
+                    await asyncio.sleep(0.8)
+                
+                rows = page.locator('table tbody tr')
+                total = await rows.count()
+                print(f"📊 Panel rows: {total} | Assigned: {len(assigned)}", flush=True)
+                
+                for i in range(total):
+                    row = rows.nth(i)
+                    cols = row.locator('td')
+                    if await cols.count() < 5: continue
+                    num = (await cols.nth(0).inner_text()).strip()
+                    if num not in assigned: continue
+                    
+                    print(f"   🔍 Checking assigned: {num}", flush=True)
+                    
+                    form = row.locator('form').first
+                    clicked = False
+                    if await form.count() > 0:
+                        try: await form.click(); clicked = True
+                        except Exception as e: print(f"   form click err: {e}", flush=True)
+                    if not clicked:
+                        btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
+                        if await btn.count() > 0:
+                            try: await btn.click(); clicked = True
+                            except Exception as e: print(f"   btn click err: {e}", flush=True)
+                    if not clicked:
+                        print(f"   ⚠️ No clickable element for {num}", flush=True)
+                        continue
+                    
+                    try:
+                        await page.wait_for_load_state('domcontentloaded', timeout=8000)
+                        await asyncio.sleep(1)
+                        dr = page.locator('table tbody tr')
+                        msgs_found = 0
+                        for j in range(await dr.count()):
+                            dc = dr.nth(j).locator('td')
+                            if await dc.count() >= 5:
+                                dt = (await dc.nth(0).inner_text()).strip()
+                                ph = (await dc.nth(1).inner_text()).strip()
+                                se = (await dc.nth(2).inner_text()).strip()
+                                ms = (await dc.nth(-1).inner_text()).strip()
+                                if ms and len(ms) > 3 and dt:
+                                    msgs_found += 1
+                                    key = f"{dt}|{ph}|{ms[:40]}"
+                                    if key not in seen:
+                                        seen.add(key)
+                                        otp = extract_otp(ms)
+                                        masked_num = mask(ph)
+                                        o[ph] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        ct = f"🔐 NEW OTP RECEIVED\n📱 Phone: `{masked_num}`\n🕐 Time: {dt}\n✉️ Sender: `{se}`\n🔢 Code: `{otp}`\n📝 Message:\n`{ms[:300]}`"
+                                        send_to_main(CHANNEL_ID, ct)
+                                        send_to_main(NEW_CHANNEL_ID, ct)
+                                        uid = None
+                                        for u_id, d in a.items():
+                                            if ph in d["numbers"]:
+                                                uid = int(u_id); break
+                                        if uid:
+                                            dm = f"🔐 YOUR OTP ARRIVED ✅\n\n📱 Number: `{ph}`\n🕐 Time: {dt}\n✉️ Sender: `{se}`\n🔢 OTP Code: `{otp}`\n\n📝 Full Message:\n`{ms[:300]}`"
+                                            send_to_main(uid, dm)
+                                        print(f"✅ OTP SENT: {masked_num} | {otp}", flush=True)
+                        print(f"   📨 Messages found for {num}: {msgs_found}", flush=True)
+                        await page.go_back()
+                        await page.wait_for_load_state('domcontentloaded', timeout=8000)
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        print(f"   detail err: {e}", flush=True)
+                        try:
+                            await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
+                            await asyncio.sleep(0.5)
+                        except: pass
+                
+                save_data(a, n, o)
+                if random.random() < 0.2:
+                    with open(cookies_file,'w') as f: json.dump(await context.cookies(), f)
+                err = 0
             else:
                 err = 0
-                for m in msgs:
-                    key = f"{m['datetime']}|{m['phone']}|{m['message'][:40]}"
-                    if key not in seen_messages:
-                        seen_messages.add(key)
-                        await send_otp(bot, m, a, o)
-                save_data(a, n, o)
-            if len(seen_messages) > 500:
-                seen_messages = set(list(seen_messages)[-250:])
+                print("ℹ️ Koi assigned number nahi — skip", flush=True)
+            
+            if len(seen) > 500:
+                seen = set(list(seen)[-250:])
         except Exception as e:
-            print(f"Poll err: {e}", flush=True)
+            err += 1
+            print(f"❌ Poll err ({err}/5): {e}", flush=True)
+            if err >= 5:
+                send_to_main(ADMIN_ID, "⚠️ FETCH FAILING — restarting thread")
+                raise Exception("Too many errors — restart")
+        
         await asyncio.sleep(POLL_INTERVAL)
 
-# ========== COMMANDS ==========
+# ========== COMMANDS — SAFE (effective_message use) ✅ ==========
+def get_text(u):
+    """Safe text getter — None nahi hoga"""
+    if u.effective_message and u.effective_message.text:
+        return u.effective_message.text
+    return ""
+
+async def reply(u, text, **kw):
+    if u.effective_message:
+        await u.effective_message.reply_text(text, **kw)
+
 async def start_cmd(u: Update, c: ContextTypes):
     uid = u.effective_user.id
-    name = u.effective_user.first_name
+    name = u.effective_user.first_name or "User"
     a, n, o = load_data()
     if not n:
-        await u.message.reply_text("⚠️ Numbers abhi upload nahi hue! Admin jald karega 🙏", parse_mode="Markdown")
+        await reply(u, "⚠️ Numbers abhi upload nahi hue! Admin jald karega 🙏", parse_mode="Markdown")
         return
     nums, is_new = assign_nums(uid, a, n, o)
     if nums is None:
-        await u.message.reply_text("😔 Saare numbers use ho chuke! Jaldi expire honge 🙏", parse_mode="Markdown")
+        await reply(u, "😔 Saare numbers use ho chuke! Jaldi expire honge 🙏", parse_mode="Markdown")
         return
     nt = "\n".join([f"  {i+1}. `{x}`" for i, x in enumerate(nums)])
     if is_new:
-        await u.message.reply_text(f"🎉 Welcome {name}!\n\n✅ Tere {len(nums)} numbers:\n{nt}\n\n⏰ 10min mein OTP aaya → permanent!\n❌ Nahi aaya → /refresh\n\n🔄 /refresh | 📱 /mynumber", parse_mode="Markdown")
+        await reply(u, f"🎉 Welcome {name}!\n\n✅ Tere {len(nums)} numbers:\n{nt}\n\n⏰ 10min mein OTP aaya → permanent!\n❌ Nahi aaya → /refresh\n\n🔄 /refresh | 📱 /mynumber", parse_mode="Markdown")
     else:
-        await u.message.reply_text(f"👋 Welcome back {name}!\n\n📱 Tere numbers:\n{nt}\n\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
+        await reply(u, f"👋 Welcome back {name}!\n\n📱 Tere numbers:\n{nt}\n\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
 
 async def mynumber_cmd(u: Update, c: ContextTypes):
     uid = str(u.effective_user.id)
@@ -293,86 +302,97 @@ async def mynumber_cmd(u: Update, c: ContextTypes):
         for i, x in enumerate(a[uid]["numbers"]):
             st = "✅ LOCKED" if x in o else "⏳ Waiting"
             nt += f"  {i+1}. `{x}` — {st}\n"
-        await u.message.reply_text(f"📱 Tere Numbers:\n{nt}\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
+        await reply(u, f"📱 Tere Numbers:\n{nt}\n🔄 Naye chahiye? /refresh", parse_mode="Markdown")
     else:
-        await u.message.reply_text("❌ Pehle /start karein", parse_mode="Markdown")
+        await reply(u, "❌ Pehle /start karein", parse_mode="Markdown")
 
 async def refresh_cmd(u: Update, c: ContextTypes):
     uid = str(u.effective_user.id)
     a, n, o = load_data()
     if uid not in a:
-        await u.message.reply_text("❌ Pehle /start karein!")
+        await reply(u, "❌ Pehle /start use karein!")
         return
     old = a[uid]
     if any(x in o for x in old["numbers"]):
-        await u.message.reply_text("✅ Tere number par OTP aaya hai — permanent tera hai ✅", parse_mode="Markdown")
+        await reply(u, "✅ Tere number par OTP aaya hai — permanent tera hai ✅", parse_mode="Markdown")
         return
     del a[uid]
     new, _ = assign_nums(uid, a, n, o)
     if new is None:
         a[uid] = old; save_data(a, n, o)
-        await u.message.reply_text("😔 Naye numbers nahi available!")
+        await reply(u, "😔 Naye numbers nahi available!")
         return
     nt = "\n".join([f"  {i+1}. `{x}`" for i, x in enumerate(new)])
-    await u.message.reply_text(f"🔄 Refreshed!\n✅ Naye numbers:\n{nt}", parse_mode="Markdown")
+    await reply(u, f"🔄 Refreshed!\n✅ Naye numbers:\n{nt}", parse_mode="Markdown")
 
 async def upload_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
-    if not u.message.text or len(u.message.text.split()) < 2:
-        return await u.message.reply_text("📝 `/uploadnumbers +591xxx, +591yyy...`", parse_mode="Markdown")
-    txt = u.message.text.replace('/uploadnumbers', '').strip()
-    nn = [x.strip() for x in re.split(r'[,\n]+', txt) if x.strip().startswith('+')]
-    if not nn: return await u.message.reply_text("❌ Koi valid number nahi!")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!")
+        return
+    txt = get_text(u)
+    parts = txt.split()
+    if len(parts) < 2:
+        await reply(u, "📝 `/uploadnumbers +591xxx, +591yyy...`", parse_mode="Markdown")
+        return
+    content = txt.replace('/uploadnumbers', '').strip()
+    nn = [x.strip() for x in re.split(r'[,\n]+', content) if x.strip().startswith('+')]
+    if not nn:
+        await reply(u, "❌ Koi valid number nahi! (+ se shuru hone chahiye)")
+        return
     a, ex, o = load_data()
     added = sum(1 for x in nn if x not in ex)
     ex.extend(x for x in nn if x not in ex)
     save_data(a, ex, o)
     avail = len(get_available(a, ex))
-    await u.message.reply_text(f"✅ Uploaded!\nNaye: {added} | Total: {len(ex)} | Available: {avail} | Locked: {len(o)}", parse_mode="Markdown")
+    await reply(u, f"✅ Uploaded!\nNaye: {added} | Total: {len(ex)} | Available: {avail} | Locked: {len(o)}", parse_mode="Markdown")
 
 async def freeuser_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
-    p = u.message.text.split()
-    if len(p) < 2: return await u.message.reply_text("Use: `/freeuser user_id`")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!"); return
+    p = get_text(u).split()
+    if len(p) < 2:
+        await reply(u, "Use: `/freeuser user_id`"); return
     a, n, o = load_data()
     t = p[1].strip()
     if t in a:
         f = len(a[t]["numbers"]); del a[t]; save_data(a, n, o)
-        await u.message.reply_text(f"✅ Freed: {f}")
-    else: await u.message.reply_text("❌ Nahi mila!")
+        await reply(u, f"✅ Freed: {f}")
+    else: await reply(u, "❌ Nahi mila!")
 
 async def stats_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!"); return
     a, n, o = load_data()
-    pw_status = "✅ Ready" if pw_ready else "⏳ Loading..."
-    await u.message.reply_text(f"📊 Total: {len(n)} | Available: {len(get_available(a,n))} | Users: {len(a)} | Locked: {len(o)}\n🌐 Browser: {pw_status}", parse_mode="Markdown")
+    await reply(u, f"📊 Total: {len(n)} | Available: {len(get_available(a,n))} | Users: {len(a)} | Locked: {len(o)}", parse_mode="Markdown")
 
 async def clearseen_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
-    global seen_messages; seen_messages = set()
-    await u.message.reply_text("✅ Cleared!")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!"); return
+    await reply(u, "✅ Seen cache clear — next poll se sab naye bhejega")
 
 async def relogin_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!"); return
     try: os.remove(cookies_file)
     except: pass
-    await u.message.reply_text("✅ Cookie deleted — auto re-login next poll")
+    await reply(u, "✅ Cookie deleted — thread auto re-login karega")
 
 async def status_cmd(u: Update, c: ContextTypes):
-    if u.effective_user.id != ADMIN_ID: return await u.message.reply_text("❌ Admin only!")
-    pw_status = "✅ Ready" if pw_ready else "⏳ Loading..."
-    await u.message.reply_text(f"✅ Bot running\n🌐 Browser: {pw_status}")
+    if u.effective_user.id != ADMIN_ID:
+        await reply(u, "❌ Admin only!"); return
+    a, n, o = load_data()
+    await reply(u, f"✅ Bot running\n📱 Numbers: {len(n)} | 👤 Users: {len(a)} | 🔒 Locked: {len(o)}\n🌐 Playwright: alag thread mein active")
 
-# ========== MAIN — BOT PEHLE START HOGA ⚡ ==========
+# ========== MAIN ==========
 async def main():
+    global main_loop, bot_ref
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing!", flush=True); return
-    
     a, n, o = load_data(); save_data(a, n, o)
     print(f"LOADED: {len(n)} numbers | {len(a)} users", flush=True)
-    
-    # ✅ STEP 1: Telegram bot TURANT start — commands instant
+    main_loop = asyncio.get_event_loop()
     app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).build()
+    bot_ref = app.bot
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("mynumber", mynumber_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
@@ -382,20 +402,12 @@ async def main():
     app.add_handler(CommandHandler("clearseen", clearseen_cmd))
     app.add_handler(CommandHandler("relogin", relogin_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    
-    print("✅ BOT ONLINE — /start turant kaam karega ⚡", flush=True)
-    
-    # ✅ STEP 2: Playwright BACKGROUND mein setup hoga — bot ko block nahi karega
-    asyncio.create_task(pw_setup_and_login())
-    
-    # ✅ STEP 3: Poll loop bhi background mein (Playwright ready hone ke baad hi kaam karega)
-    asyncio.create_task(poll_loop(app.bot))
-    
-    # Keep running
+    print("✅ BOT ONLINE — /start INSTANT ⚡", flush=True)
+    t = threading.Thread(target=playwright_thread, daemon=True)
+    t.start()
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
