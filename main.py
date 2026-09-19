@@ -31,18 +31,15 @@ page = None
 seen_messages = set()
 cookies_file = "panel_cookies.json"
 
-# ========== SAFE SEND — WITH RETRY + ERROR HANDLING ✅ ==========
+# ========== SAFE SEND — RETRY + NO CRASH ✅ ==========
 async def safe_send(bot, chat_id, text):
-    """Send message with 3 retries — never crashes"""
     for attempt in range(3):
         try:
             await bot.send_message(chat_id, text, parse_mode="Markdown", read_timeout=15, write_timeout=15)
             return True
-        except Exception as e:
+        except Exception:
             if attempt < 2:
                 await asyncio.sleep(2)
-            else:
-                print(f"Send failed to {chat_id}: {e}", flush=True)
     return False
 
 # ========== DATA ==========
@@ -230,14 +227,14 @@ async def get_all_messages():
         if random.random() < 0.2:
             await save_cookies()
         return all_messages, "ok"
-    except Exception as e:
+    except Exception:
         return None, "error"
 
 def extract_otp(txt):
     m = re.search(r'\b(\d{4,8})\b', txt)
     return m.group(1) if m else "N/A"
 
-# ========== SEND OTP — SAFE VERSION ✅ ==========
+# ========== SEND OTP ==========
 async def send_otp(bot, msg, assignments, active_otps):
     otp = extract_otp(msg['message'])
     masked = mask_phone(msg['phone'])
@@ -253,11 +250,9 @@ async def send_otp(bot, msg, assignments, active_otps):
         f"📝 Message:\n`{msg['message'][:300]}`"
     )
     
-    # ✅ Safe send — no crash, auto-retry
     await safe_send(bot, CHANNEL_ID, channel_text)
     await safe_send(bot, NEW_CHANNEL_ID, channel_text)
     
-    # Find user and send DM
     user_id = None
     for uid, data in assignments.items():
         if full in data["numbers"]:
@@ -278,10 +273,10 @@ async def send_otp(bot, msg, assignments, active_otps):
     print(f"OTP: {masked} | {otp}", flush=True)
     return active_otps
 
-# ========== POLL LOOP ==========
+# ========== POLL LOOP — BACKGROUND ✅ ==========
 async def poll_loop(bot):
     global seen_messages
-    print(f"BOT ONLINE | Poll: {POLL_INTERVAL}s | Auto-free: {EXPIRE_MINUTES}min", flush=True)
+    print(f"POLLING STARTED | {POLL_INTERVAL}s | Auto-free: {EXPIRE_MINUTES}min", flush=True)
     err = 0
     cleanup_counter = 0
     
@@ -316,7 +311,7 @@ async def poll_loop(bot):
         
         await asyncio.sleep(max(5, POLL_INTERVAL))
 
-# ========== USER COMMANDS ==========
+# ========== USER COMMANDS — INSTANT RESPONSE ✅ ==========
 async def start_cmd(u: Update, c: ContextTypes):
     user_id = u.effective_user.id
     name = u.effective_user.first_name
@@ -484,7 +479,7 @@ async def testfetch_cmd(u: Update, c: ContextTypes):
     msgs, _ = await get_all_messages()
     await u.message.reply_text(f"✅ {len(msgs)} found" if msgs else "❌ Nothing")
 
-# ========== MAIN ==========
+# ========== MAIN — BACKGROUND POLLING = INSTANT COMMANDS ✅ ==========
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing!", flush=True)
@@ -492,11 +487,11 @@ async def main():
     assignments, numbers, active_otps = load_data()
     save_data(assignments, numbers, active_otps)
     print(f"LOADED: {len(numbers)} numbers | {len(assignments)} users", flush=True)
+    
     await setup_browser()
     if not await is_logged_in():
         await do_login()
     
-    # ✅ Bot with longer timeouts — no more TimedOut errors
     app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).build()
     
     app.add_handler(CommandHandler("start", start_cmd))
@@ -515,7 +510,14 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    await poll_loop(app.bot)
+    
+    # ✅ KEY: Polling background mein → commands instant
+    asyncio.create_task(poll_loop(app.bot))
+    
+    print("✅ BOT ONLINE — Commands INSTANT respond karenge ⚡", flush=True)
+    
+    # Keep running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
